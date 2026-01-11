@@ -8,7 +8,7 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct TaskHeader {
     id: TaskId,
-    qid: i32,
+    qid: u8,
     // changes to true when task is enqueued
     // if this flag is true, it's not enqueued again
     queued: AtomicBool,
@@ -24,7 +24,7 @@ pub struct TaskHeader {
 }
 
 impl TaskHeader {
-    pub fn new(id: TaskId, qid: i32, ingress_tx: Sender<TaskId>) -> Self {
+    pub fn new(id: TaskId, qid: u8, ingress_tx: Sender<TaskId>) -> Self {
         Self {
             id,
             qid,
@@ -34,7 +34,7 @@ impl TaskHeader {
             ingress_tx,
         }
     }
-    pub fn qid(&self) -> i32 {
+    pub fn qid(&self) -> u8 {
         self.qid
     }
     pub fn enqueue(&self) {

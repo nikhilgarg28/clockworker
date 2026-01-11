@@ -4,7 +4,7 @@ use std::time::Instant;
 pub type TaskId = usize;
 
 pub struct Queue {
-    id: i32,
+    id: u8,
     share: u64,
     scheduler: Box<dyn Scheduler>,
 }
@@ -12,7 +12,7 @@ pub struct Queue {
 impl Queue {
     pub fn new<ID>(id: ID, share: u64, scheduler: Box<dyn Scheduler>) -> Self
     where
-        ID: Into<i32>,
+        ID: Into<u8>,
     {
         let id = id.into();
         Self {
@@ -21,7 +21,7 @@ impl Queue {
             scheduler,
         }
     }
-    pub fn id(&self) -> i32 {
+    pub fn id(&self) -> u8 {
         self.id
     }
     pub fn share(&self) -> u64 {

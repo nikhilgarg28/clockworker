@@ -10,7 +10,7 @@ use slab::Slab;
 use static_assertions::assert_not_impl_any;
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     future::Future,
     pin::Pin,
     rc::Rc,
@@ -99,7 +99,13 @@ pub struct Executor {
     ingress_rx: Receiver<TaskId>,
 
     tasks: RefCell<Slab<TaskRecord>>,
-    queues: RefCell<HashMap<i32, QueueState>>,
+    queues: RefCell<Vec<QueueState>>,
+    qids: RefCell<Vec<u8>>,
+
+    sched_latency: Duration,
+    min_slice: Duration,
+    driver_yield: Duration,
+    min_vruntime: u128,
 }
 assert_not_impl_any!(Executor: Send, Sync);
 
@@ -115,16 +121,23 @@ impl Executor {
 
         let (tx, rx) = flume::unbounded::<TaskId>();
 
+        let qids = queues.iter().map(|q| q.id() as u8).collect::<Vec<_>>();
         let queues = queues
             .into_iter()
-            .map(|q| (q.id(), QueueState::new(q)))
-            .collect::<HashMap<_, _>>();
+            .map(|q| QueueState::new(q))
+            .collect::<Vec<_>>();
 
         Ok(Rc::new(Self {
             ingress_tx: tx,
             ingress_rx: rx,
             tasks: RefCell::new(Slab::new()),
             queues: RefCell::new(queues),
+            qids: RefCell::new(qids),
+            // TODO: make these configurable
+            sched_latency: Duration::from_millis(2),
+            min_slice: Duration::from_micros(100),
+            driver_yield: Duration::from_micros(500),
+            min_vruntime: 0,
         }))
     }
 
@@ -134,18 +147,17 @@ impl Executor {
     where
         T: 'static,
         F: Future<Output = T> + 'static, // !Send ok
-        ID: Into<i32>,
+        ID: Into<u8>,
     {
         let join = Arc::new(JoinState::<T>::new());
 
         let mut tasks = self.tasks.borrow_mut();
-        let entry = tasks.vacant_entry();
         let qid = qid.into();
-        if !self.queues.borrow().contains_key(&qid) {
+        let Some(_) = self.qids.borrow().iter().position(|q| *q == qid) else {
             return Err(format!("Queue not found for id: {}", qid));
-        }
+        };
+        let entry = tasks.vacant_entry();
         let id = entry.key();
-
         let header = Arc::new(TaskHeader::new(id, qid, self.ingress_tx.clone()));
 
         // Wrap user future to publish result into JoinState.
@@ -174,32 +186,32 @@ impl Executor {
         let Some(task) = tasks.get(id) else {
             return;
         };
+        let qid = task.header.qid();
+        let Some(idx) = self.qids.borrow().iter().position(|q| *q == qid) else {
+            unreachable!("Queue not found for id: {}", qid);
+        };
         let mut queues = self.queues.borrow_mut();
-        let queue = queues.get_mut(&task.header.qid());
-        assert!(
-            queue.is_some(),
-            "Queue not found for queue id: {}",
-            task.header.qid()
-        );
-        queue.unwrap().scheduler.push(id);
+        let queue = &mut queues[idx];
+        queue.scheduler.push(id);
     }
 
     /// Pick the next runnable class by min vruntime among classes that have runnable tasks.
     /// Vruntime is computed as total_cpu_nanos / weight, so higher weight classes
     /// have lower vruntime for the same CPU time, making them preferred.
-    fn pick_next_class(&self) -> Option<i32> {
-        let mut best: Option<(i32, u128)> = None;
+    fn pick_next_class(&self) -> Option<usize> {
+        let mut best: Option<(usize, u128)> = None;
 
-        for (id, q) in self.queues.borrow().iter() {
+        for (idx, q) in self.queues.borrow().iter().enumerate() {
             if !q.scheduler.is_runnable() {
                 continue;
             }
             // Compute vruntime = total_cpu_nanos / weight
             // Higher weight => lower vruntime for same CPU time => preferred
+            // TODO: don't compute vruntime here
             let vruntime = q.total_cpu_nanos / (q.share as u128);
             match best {
-                None => best = Some((*id, vruntime)),
-                Some((_, bv)) if vruntime < bv => best = Some((*id, vruntime)),
+                None => best = Some((idx, vruntime)),
+                Some((_, bv)) if vruntime < bv => best = Some((idx, vruntime)),
                 _ => {}
             }
         }
@@ -209,12 +221,10 @@ impl Executor {
     /// Charge elapsed CPU time to a class.
     /// We track total CPU time in nanoseconds and compute vruntime on-the-fly
     /// when selecting (total_cpu_nanos / weight), avoiding rounding issues.
-    fn charge_class(&self, class_id: i32, elapsed: Duration) {
+    fn charge_class(&self, qidx: usize, elapsed: Duration) {
         let mut queues = self.queues.borrow_mut();
-        let qs = queues.get_mut(&class_id);
-        assert!(qs.is_some(), "Queue not found for class id: {}", class_id);
-        let qs = qs.unwrap();
-        qs.total_cpu_nanos = qs.total_cpu_nanos.saturating_add(elapsed.as_nanos());
+        let queue = &mut queues[qidx];
+        queue.total_cpu_nanos = queue.total_cpu_nanos.saturating_add(elapsed.as_nanos());
     }
 
     /// Run the executor loop forever.
@@ -240,13 +250,11 @@ impl Executor {
                 }
             }
             // Choose class, then choose task within class.
-            let qid = self.pick_next_class().expect("checked runnable");
+            let qidx = self.pick_next_class().expect("checked runnable");
             let mut maybe_task = {
                 let mut queues = self.queues.borrow_mut();
-                let qs = queues.get_mut(&qid);
-                assert!(qs.is_some(), "Queue not found for class id: {}", qid);
-                let qs = qs.unwrap();
-                qs.scheduler.pop()
+                let queue = &mut queues[qidx];
+                queue.scheduler.pop()
             };
 
             // Skip dead/stale tasks if policy had tombstones or late notifications.
@@ -262,7 +270,7 @@ impl Executor {
                     maybe_task = self
                         .queues
                         .borrow_mut()
-                        .get_mut(&qid)
+                        .get_mut(qidx)
                         .unwrap()
                         .scheduler
                         .pop();
@@ -273,9 +281,7 @@ impl Executor {
                     // before so nothing to do here
                     drop(tasks);
                     let mut queues = self.queues.borrow_mut();
-                    let queue = queues.get_mut(&qid);
-                    assert!(queue.is_some(), "Queue not found for class id: {}", qid);
-                    let queue = queue.unwrap();
+                    let queue = &mut queues[qidx];
                     maybe_task = queue.scheduler.pop();
                     continue;
                 }
@@ -306,27 +312,24 @@ impl Executor {
 
             let end = Instant::now();
             let elapsed = end.saturating_duration_since(start);
-            self.charge_class(qid, elapsed);
+            self.charge_class(qidx, elapsed);
 
-            let ready = match poll {
+            match poll {
                 Poll::Ready(()) => {
                     task.header.set_done();
                     tasks.remove(id);
                     let mut queues = self.queues.borrow_mut();
-                    let qs = queues.get_mut(&qid);
-                    assert!(qs.is_some(), "Queue not found for class id: {}", qid);
-                    let qs = qs.unwrap();
-                    qs.scheduler.clear_state(id);
-                    true
+                    let queue = &mut queues[qidx];
+                    queue.scheduler.clear_state(id);
+                    queue.scheduler.record(id, start, end, true);
                 }
                 // Task is still running, nothing to do.
-                Poll::Pending => false,
+                Poll::Pending => {
+                    let mut queues = self.queues.borrow_mut();
+                    let queue = &mut queues[qidx];
+                    queue.scheduler.record(id, start, end, false);
+                }
             };
-            let mut queues = self.queues.borrow_mut();
-            let qs = queues.get_mut(&qid);
-            assert!(qs.is_some(), "Queue not found for class id: {}", qid);
-            let qs = qs.unwrap();
-            qs.scheduler.record(id, start, end, ready);
 
             // Give the underlying runtime a chance to run its drivers.
             yield_once().await;
@@ -728,8 +731,8 @@ mod tests {
             High,
             Low,
         }
-        impl Into<i32> for QueueId {
-            fn into(self) -> i32 {
+        impl Into<u8> for QueueId {
+            fn into(self) -> u8 {
                 match self {
                     QueueId::High => 0,
                     QueueId::Low => 1,
