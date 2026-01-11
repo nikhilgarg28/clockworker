@@ -1,6 +1,7 @@
 use crate::{
     join::{JoinHandle, JoinState},
     queue::{Queue, Scheduler, TaskId},
+    stats::{ExecutorStats, QueueStats},
     task::TaskHeader,
     yield_once::yield_once,
 };
@@ -90,12 +91,14 @@ struct QueueState {
     vruntime: u128, // total CPU time consumed (in nanoseconds)
     share: u64,
     scheduler: Box<dyn Scheduler>,
+    stats: QueueStats,
 }
 
 impl QueueState {
     fn new(queue: Queue) -> Self {
         Self {
             vruntime: 0,
+            stats: QueueStats::new(queue.id(), queue.share()),
             share: queue.share(),
             scheduler: queue.scheduler(),
         }
@@ -115,6 +118,8 @@ pub struct Executor {
     driver_yield: Duration,
     min_vruntime: std::cell::Cell<u128>,
     num_driver_yields: AtomicU64,
+    // stats
+    stats: RefCell<ExecutorStats>,
 }
 assert_not_impl_any!(Executor: Send, Sync);
 
@@ -151,6 +156,7 @@ impl Executor {
             driver_yield: Duration::from_micros(500),
             min_vruntime: std::cell::Cell::new(0),
             num_driver_yields: AtomicU64::new(0),
+            stats: RefCell::new(ExecutorStats::new(Instant::now())),
         }))
     }
 
@@ -188,13 +194,16 @@ impl Executor {
     }
 
     /// Drain ingress notifications and route runnable tasks into their class policies.
-    fn drain_ingress_into_classes(&self) {
+    fn drain_ingress_into_classes(&self, now: Instant) {
+        let mut drained = 0u64;
         while let Ok(id) = self.ingress_rx.try_recv() {
-            self.enqueue_task(id);
+            drained += 1;
+            self.enqueue_task(id, now);
         }
+        self.stats.borrow_mut().record_wakeups_drained(drained);
     }
 
-    fn enqueue_task(&self, id: TaskId) {
+    fn enqueue_task(&self, id: TaskId, now: Instant) {
         let tasks = self.tasks.borrow();
         let Some(task) = tasks.get(id) else {
             return;
@@ -205,12 +214,15 @@ impl Executor {
         };
         let mut queues = self.queues.borrow_mut();
         let queue = &mut queues[idx];
-        let is_runnable = queue.scheduler.is_runnable();
+        let was_runnable = queue.scheduler.is_runnable();
         queue.scheduler.push(id);
+        let now_runnable = queue.scheduler.is_runnable();
+        let became_runnable = !was_runnable && now_runnable;
         // this queue just became runnable, so update its vruntime
-        if !is_runnable && queue.scheduler.is_runnable() {
+        if became_runnable {
             queue.vruntime = queue.vruntime.max(self.min_vruntime.get());
         }
+        queue.stats.record_runnable_enqueue(became_runnable, now);
     }
 
     /// Pick the next runnable class by deadline among classes that have
@@ -254,6 +266,7 @@ impl Executor {
         // ceil of (elapsed / share)
         let incr = (elapsed.as_nanos() + queue.share as u128 - 1) / (queue.share as u128);
         queue.vruntime += incr;
+        queue.stats.record_poll(elapsed);
     }
     fn update_min_vruntime(&self, including: u128) {
         let min_vruntime = self
@@ -270,20 +283,49 @@ impl Executor {
         self.min_vruntime.set(prev_min_vruntime.max(min_vruntime));
     }
 
+    /// Get the current executor stats.
+    pub fn stats(&self) -> ExecutorStats {
+        self.stats.borrow().clone()
+    }
+
+    /// Get the current queue stats.
+    pub fn qstats(&self) -> Vec<QueueStats> {
+        self.queues
+            .borrow()
+            .iter()
+            .map(|q| q.stats.clone())
+            .collect()
+    }
+
     /// Run the executor loop forever.
     ///
     /// Panic behavior: if any task panics while being polled, the executor panics (propagates).
     pub async fn run(&self) -> () {
+        let mut last_driver_yield_at = Instant::now();
         loop {
+            self.stats.borrow_mut().record_loop_iter();
+            let now = Instant::now();
             // Always ingest wakeups first.
-            self.drain_ingress_into_classes();
+            self.drain_ingress_into_classes(now);
 
             // If nothing runnable, park by awaiting one ingress item.
-            if self.pick_next_class().is_none() {
+            let next = {
+                let t1 = Instant::now();
+                let next = self.pick_next_class();
+                let elapsed = Instant::now().duration_since(t1);
+                self.stats.borrow_mut().record_schedule_decision(elapsed);
+                next
+            };
+            if next.is_none() {
+                let idle_start = Instant::now();
                 // park self until new item is enqueued
-                match self.ingress_rx.recv_async().await {
+                let recv = self.ingress_rx.recv_async().await;
+                let idle_end = Instant::now();
+                let idle_duration = idle_end.duration_since(idle_start);
+                self.stats.borrow_mut().idle_ns += idle_duration.as_nanos();
+                match recv {
                     Ok(id) => {
-                        self.enqueue_task(id);
+                        self.enqueue_task(id, now);
                         continue;
                     }
                     Err(_) => {
@@ -295,12 +337,17 @@ impl Executor {
             // Choose class, then choose task within class.
             let (qidx, timeslice) = self.pick_next_class().expect("checked runnable");
             let timeslice = timeslice.min(self.driver_yield);
-            let class_end = Instant::now() + timeslice;
+            let now = Instant::now();
+            let class_end = now + timeslice;
+            self.queues.borrow_mut()[qidx]
+                .stats
+                .record_first_service_after_runnable(now);
             'timeslice: loop {
                 set_yield_maybe_deadline(class_end);
                 let mut maybe_task = {
                     let mut queues = self.queues.borrow_mut();
                     let queue = &mut queues[qidx];
+                    queue.stats.record_runnable_dequeue();
                     queue.scheduler.pop()
                 };
 
@@ -314,13 +361,10 @@ impl Executor {
                     let Some(task) = tasks.get(id) else {
                         // Stale id; pick again from same class.
                         drop(tasks);
-                        maybe_task = self
-                            .queues
-                            .borrow_mut()
-                            .get_mut(qidx)
-                            .unwrap()
-                            .scheduler
-                            .pop();
+                        let mut queues = self.queues.borrow_mut();
+                        let queue = &mut queues[qidx];
+                        queue.stats.record_runnable_dequeue();
+                        maybe_task = queue.scheduler.pop();
                         continue;
                     };
                     if task.header.is_done() {
@@ -376,6 +420,10 @@ impl Executor {
                     }
                 };
                 if end > class_end {
+                    self.stats.borrow_mut().record_poll(elapsed, true);
+                    let mut queues = self.queues.borrow_mut();
+                    queues[qidx].stats.record_slice_overrun();
+                    queues[qidx].stats.record_slice_exhausted();
                     break 'timeslice;
                 }
             }
@@ -385,7 +433,15 @@ impl Executor {
             self.update_min_vruntime(new_vruntime);
 
             // Give the underlying runtime a chance to run its drivers.
+            let now = Instant::now();
+            let since_last = now - last_driver_yield_at;
             yield_once().await;
+            last_driver_yield_at = Instant::now();
+            let in_driver = last_driver_yield_at.duration_since(now);
+
+            self.stats
+                .borrow_mut()
+                .record_driver_yield(since_last, in_driver);
             self.num_driver_yields.fetch_add(1, Ordering::Relaxed);
         }
     }

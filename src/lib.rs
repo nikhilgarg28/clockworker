@@ -3,6 +3,7 @@ mod yield_once;
 
 mod join;
 mod queue;
+mod stats;
 mod task;
 
 pub use executor::{yield_maybe, Executor};
