@@ -11,3 +11,5 @@ static_assertions = "1.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["time", "rt", "macros"] }
+monoio = { version = "0.2" }
+smol = { version = "2.0" }

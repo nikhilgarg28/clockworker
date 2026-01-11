@@ -927,4 +927,92 @@ mod tests {
             })
             .await;
     }
+
+    // Test with smol runtime
+    #[test]
+    fn test_smol_runtime() {
+        let queue = Queue::new(0, 1, Box::new(FifoQueue::new()));
+        let executor = Executor::new(vec![queue]).unwrap();
+        let executor_clone = executor.clone();
+        let smol_local_ex = smol::LocalExecutor::new();
+        let h1 = smol_local_ex.spawn(async move {
+            executor_clone.run().await;
+        });
+        let h2 = smol_local_ex.spawn(async move {
+            let handle = executor.spawn(0, async move { 42 }).unwrap();
+            handle.await
+        });
+
+        let res = smol::future::block_on(smol_local_ex.run(async {
+            let res = h2.await;
+            drop(h1);
+            res
+        }));
+        assert_eq!(res, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn test_abort_after_done() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let queue = Queue::new(0, 1, Box::new(FifoQueue::new()));
+                let executor = Executor::new(vec![queue]).unwrap();
+                let executor_clone = executor.clone();
+                local.spawn_local(async move {
+                    executor_clone.run().await;
+                });
+                let counter = Arc::new(AtomicU32::new(0));
+                let counter_clone = counter.clone();
+                let handle = executor
+                    .spawn(0, async move {
+                        counter_clone.fetch_add(1, Ordering::Relaxed);
+                        42
+                    })
+                    .unwrap();
+                sleep(Duration::from_millis(100)).await;
+                assert_eq!(counter.load(Ordering::Relaxed), 1);
+                // task is done but abort should still work - no-op
+                handle.abort();
+                let result = handle.await;
+                assert_eq!(result, Ok(42));
+            })
+            .await;
+    }
+
+    // Test with monoio runtime
+    #[test]
+    fn test_monoio_runtime() {
+        use monoio::LegacyDriver;
+        let mut rt = monoio::RuntimeBuilder::<LegacyDriver>::new()
+            .enable_timer() // Explicitly enable the timer
+            .build()
+            .unwrap();
+        let _ = rt.block_on(async move {
+            let queue = Queue::new(0, 1, Box::new(FifoQueue::new()));
+            let executor = Executor::new(vec![queue]).unwrap();
+            let counter = Arc::new(AtomicU32::new(0));
+
+            let counter_clone = counter.clone();
+            let handle = executor
+                .spawn(0, async move {
+                    counter_clone.fetch_add(1, Ordering::Relaxed);
+                    42
+                })
+                .unwrap();
+
+            // initial value should be 0
+            assert_eq!(counter.load(Ordering::Relaxed), 0);
+            // Run executor in background
+            let executor_clone = executor.clone();
+            monoio::spawn(async move {
+                executor_clone.run().await;
+            });
+            monoio::time::sleep(Duration::from_millis(100)).await;
+            // task should have completed
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+            let result = handle.await;
+            assert_eq!(result, Ok(42));
+        });
+    }
 }
