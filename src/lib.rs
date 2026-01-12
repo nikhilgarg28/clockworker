@@ -7,7 +7,7 @@ mod scheduler;
 mod stats;
 mod task;
 
-pub use executor::{yield_maybe, Executor};
+pub use executor::{yield_maybe, Executor, ExecutorBuilder};
 pub use join::{JoinError, JoinHandle};
 pub use queue::{Queue, QueueKey};
-pub use scheduler::{RunnableFifo, Scheduler, LAS};
+pub use scheduler::{ArrivalFifo, RunnableFifo, Scheduler, LAS};

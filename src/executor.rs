@@ -226,6 +226,40 @@ impl<K: QueueKey> QueueHandle<K> {
     }
 }
 
+pub struct ExecutorBuilder<K: QueueKey> {
+    options: ExecutorOptions,
+    queues: Vec<Queue<K>>,
+}
+impl<K: QueueKey> ExecutorBuilder<K> {
+    pub fn new() -> Self {
+        Self {
+            options: ExecutorOptions::default(),
+            queues: Vec::new(),
+        }
+    }
+    pub fn with_sched_latency(mut self, sched_latency: Duration) -> Self {
+        self.options.sched_latency = sched_latency;
+        self
+    }
+    pub fn with_min_slice(mut self, min_slice: Duration) -> Self {
+        self.options.min_slice = min_slice;
+        self
+    }
+    pub fn with_driver_yield(mut self, driver_yield: Duration) -> Self {
+        self.options.driver_yield = driver_yield;
+        self
+    }
+    pub fn with_queue<S: Scheduler + 'static>(mut self, qid: K, share: u64, scheduler: S) -> Self {
+        let scheduler: Box<dyn Scheduler> = Box::new(scheduler);
+        let queue = Queue::new(qid, share, scheduler);
+        self.queues.push(queue);
+        self
+    }
+    pub fn build(self) -> Result<Rc<Executor<K>>, String> {
+        Executor::new(self.options, self.queues)
+    }
+}
+
 pub struct ExecutorOptions {
     sched_latency: Duration,
     min_slice: Duration,
@@ -238,20 +272,6 @@ impl Default for ExecutorOptions {
             min_slice: Duration::from_micros(100),
             driver_yield: Duration::from_micros(500),
         }
-    }
-}
-impl ExecutorOptions {
-    pub fn with_sched_latency(mut self, sched_latency: Duration) -> Self {
-        self.sched_latency = sched_latency;
-        self
-    }
-    pub fn with_min_slice(mut self, min_slice: Duration) -> Self {
-        self.min_slice = min_slice;
-        self
-    }
-    pub fn with_driver_yield(mut self, driver_yield: Duration) -> Self {
-        self.driver_yield = driver_yield;
-        self
     }
 }
 
@@ -748,10 +768,10 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor =
-                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
-                        .unwrap();
+                let executor = ExecutorBuilder::new()
+                    .with_queue(0, 1, RunnableFifo::new())
+                    .build()
+                    .unwrap();
                 let counter = Arc::new(AtomicU32::new(0));
 
                 let counter_clone = counter.clone();
@@ -779,10 +799,10 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor =
-                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
-                        .unwrap();
+                let executor = ExecutorBuilder::new()
+                    .with_queue(0, 1, RunnableFifo::new())
+                    .build()
+                    .unwrap();
 
                 let queue = executor.queue(0).unwrap();
                 let handle = queue.spawn(async move { 42 });
@@ -805,10 +825,10 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let opts = ExecutorOptions::default();
-                let executor =
-                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
-                        .unwrap();
+                let executor = ExecutorBuilder::new()
+                    .with_queue(0, 1, RunnableFifo::new())
+                    .build()
+                    .unwrap();
                 let started = Arc::new(AtomicBool::new(false));
                 let completed = Arc::new(AtomicBool::new(false));
 
