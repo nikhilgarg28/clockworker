@@ -3,6 +3,7 @@ mod yield_once;
 
 mod join;
 mod queue;
+mod shutdown;
 mod stats;
 mod task;
 

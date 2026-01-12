@@ -16,7 +16,7 @@ use std::{
     future::Future,
     pin::Pin,
     rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::Ordering,
     sync::Arc,
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -27,6 +27,12 @@ thread_local! {
 
 fn set_yield_maybe_deadline(deadline: Instant) {
     YIELD_MAYBE_DEADLINE.with(|cell| cell.set(Some(deadline)));
+}
+
+#[derive(Debug)]
+pub enum SpawnError {
+    ShuttingDown,
+    QueueNotFound(u8),
 }
 
 /// Wraps a user given future to make it cancelable
@@ -104,10 +110,93 @@ impl QueueState {
         }
     }
 }
+/// How the executor should shut down.
+#[derive(Clone, Copy, Debug)]
+pub enum ShutdownMode {
+    /// Stop accepting new tasks; keep running until no tasks remain.
+    Drain,
+    /// Stop accepting new tasks; keep running until drained or deadline, then force.
+    DrainFor(Duration),
+    /// Stop accepting new tasks; cancel everything and finish ASAP.
+    Force,
+}
+
+/// Shared inner state between executor and handles (single-thread; !Send).
+#[derive(Debug)]
+pub struct ShutdownState {
+    requested: Cell<Option<(Instant, ShutdownMode)>>,
+    force_initiated: Cell<bool>,
+    /// Wakers waiting for shutdown completion.
+    waiters: RefCell<Vec<std::task::Waker>>,
+    accepting: Cell<bool>,
+    /// Set when executor has fully stopped and shutdown is complete.
+    stopped: Cell<bool>,
+}
+
+impl ShutdownState {
+    pub fn new() -> Self {
+        Self {
+            accepting: Cell::new(true),
+            requested: Cell::new(None),
+            force_initiated: Cell::new(false),
+            waiters: RefCell::new(Vec::new()),
+            stopped: Cell::new(false),
+        }
+    }
+    fn request_shutdown(&self, mode: ShutdownMode) {
+        if self.requested.get().is_some() {
+            return;
+        }
+        self.requested.set(Some((Instant::now(), mode)));
+    }
+
+    // Mark the executor as stopped and wake all waiters.
+    fn mark_stopped_and_wake_waiters(&self) {
+        self.stopped.set(true);
+        for w in self.waiters.borrow_mut().drain(..) {
+            w.wake();
+        }
+    }
+    fn requested(&self) -> bool {
+        self.requested.get().is_some()
+    }
+}
+
+/// Await this to learn when shutdown is complete.
+/// TODO: should we build this as future on Executor itself?
+#[derive(Clone)]
+pub struct ShutdownHandle {
+    inner: Rc<ShutdownState>,
+}
+
+impl Future for ShutdownHandle {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.inner.stopped.get() {
+            return Poll::Ready(());
+        }
+        // Register as waiter
+        let mut waiters = self.inner.waiters.borrow_mut();
+        // TODO: avoid unbounded growth if polled repeatedly with same waker
+        waiters.push(cx.waker().clone());
+        Poll::Pending
+    }
+}
+impl ShutdownHandle {
+    pub fn new(inner: Rc<ShutdownState>) -> Self {
+        Self { inner }
+    }
+}
 /// The priority executor: single-thread polling + class vruntime selection.
 pub struct Executor {
     ingress_tx: Sender<TaskId>,
     ingress_rx: Receiver<TaskId>,
+
+    /// Number of live tasks known to the executor.
+    live_tasks: std::sync::atomic::AtomicUsize,
+
+    shutdown: Rc<ShutdownState>,
 
     tasks: RefCell<Slab<TaskRecord>>,
     queues: RefCell<Vec<QueueState>>,
@@ -117,7 +206,6 @@ pub struct Executor {
     min_slice: Duration,
     driver_yield: Duration,
     min_vruntime: std::cell::Cell<u128>,
-    num_driver_yields: AtomicU64,
     // stats
     stats: RefCell<ExecutorStats>,
 }
@@ -149,20 +237,48 @@ impl Executor {
             ingress_rx: rx,
             tasks: RefCell::new(Slab::new()),
             queues: RefCell::new(queues),
+            shutdown: Rc::new(ShutdownState::new()),
             qids: RefCell::new(qids),
+            live_tasks: std::sync::atomic::AtomicUsize::new(0),
             // TODO: make these configurable
             sched_latency: Duration::from_millis(2),
             min_slice: Duration::from_micros(100),
             driver_yield: Duration::from_micros(500),
             min_vruntime: std::cell::Cell::new(0),
-            num_driver_yields: AtomicU64::new(0),
             stats: RefCell::new(ExecutorStats::new(Instant::now())),
         }))
     }
 
+    fn ensure_accepting(self: &Rc<Self>) -> Result<(), SpawnError> {
+        if self.shutdown.accepting.get() {
+            Ok(())
+        } else {
+            Err(SpawnError::ShuttingDown)
+        }
+    }
+
+    fn should_force_now(&self, now: Instant) -> bool {
+        match self.shutdown.requested.get() {
+            None => false,
+            Some((_, ShutdownMode::Force)) => true,
+            Some((asof, ShutdownMode::DrainFor(deadline))) => now - asof >= deadline,
+            Some((_, ShutdownMode::Drain)) => false,
+        }
+    }
+
+    /// Called by executor thread when it wants to force-cancel remaining tasks.
+    /// You can implement this using your task table: mark cancelled and enqueue, or just drop tasks.
+    fn force_cancel_all_tasks(&self) {
+        let tasks = self.tasks.borrow_mut();
+        for (_, task) in tasks.iter() {
+            task.header.cancel();
+            task.header.enqueue();
+        }
+    }
+
     /// Spawn onto a class (queue). Returns a JoinHandle that detaches on drop.
     /// Spawn can only be called from the executor thread.
-    pub fn spawn<ID, T, F>(self: &Rc<Self>, qid: ID, fut: F) -> Result<JoinHandle<T>, String>
+    pub fn spawn<ID, T, F>(self: &Rc<Self>, qid: ID, fut: F) -> Result<JoinHandle<T>, SpawnError>
     where
         T: 'static,
         F: Future<Output = T> + 'static, // !Send ok
@@ -173,8 +289,9 @@ impl Executor {
         let mut tasks = self.tasks.borrow_mut();
         let qid = qid.into();
         let Some(_) = self.qids.borrow().iter().position(|q| *q == qid) else {
-            return Err(format!("Queue not found for id: {}", qid));
+            return Err(SpawnError::QueueNotFound(qid));
         };
+        self.ensure_accepting()?;
         let entry = tasks.vacant_entry();
         let id = entry.key();
         let header = Arc::new(TaskHeader::new(id, qid, self.ingress_tx.clone()));
@@ -186,6 +303,8 @@ impl Executor {
             header: header.clone(),
             fut: Box::pin(wrapped),
         });
+        // increment live tasks
+        self.live_tasks.fetch_add(1, Ordering::Relaxed);
 
         // Enqueue initially.
         header.enqueue();
@@ -303,8 +422,17 @@ impl Executor {
     pub async fn run(&self) -> () {
         let mut last_driver_yield_at = Instant::now();
         loop {
-            self.stats.borrow_mut().record_loop_iter();
             let now = Instant::now();
+            println!("run loop iteration");
+            if self.should_force_now(now) && !self.shutdown.force_initiated.get() {
+                println!("inside should_force_now");
+                // Cancel remaining tasks
+                println!("cancelling all tasks");
+                self.force_cancel_all_tasks();
+                println!("cancelled all tasks");
+            }
+
+            self.stats.borrow_mut().record_loop_iter();
             // Always ingest wakeups first.
             self.drain_ingress_into_classes(now);
 
@@ -407,6 +535,7 @@ impl Executor {
                     Poll::Ready(()) => {
                         task.header.set_done();
                         tasks.remove(id);
+                        self.live_tasks.fetch_sub(1, Ordering::Relaxed);
                         let mut queues = self.queues.borrow_mut();
                         let queue = &mut queues[qidx];
                         queue.scheduler.clear_state(id);
@@ -432,6 +561,13 @@ impl Executor {
             let new_vruntime = self.queues.borrow()[qidx].vruntime;
             self.update_min_vruntime(new_vruntime);
 
+            if self.shutdown.requested() {
+                if self.num_live_tasks() == 0 {
+                    self.shutdown.mark_stopped_and_wake_waiters();
+                    break;
+                }
+            }
+
             // Give the underlying runtime a chance to run its drivers.
             let now = Instant::now();
             let since_last = now - last_driver_yield_at;
@@ -442,8 +578,16 @@ impl Executor {
             self.stats
                 .borrow_mut()
                 .record_driver_yield(since_last, in_driver);
-            self.num_driver_yields.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn num_live_tasks(&self) -> usize {
+        self.live_tasks.load(Ordering::Relaxed)
+    }
+    pub fn shutdown(&self, mode: ShutdownMode) -> ShutdownHandle {
+        self.shutdown.accepting.set(false);
+        self.shutdown.request_shutdown(mode);
+        ShutdownHandle::new(self.shutdown.clone())
     }
 }
 
@@ -974,7 +1118,7 @@ mod tests {
                 sleep(Duration::from_millis(100)).await;
                 let count = counter1.load(Ordering::Relaxed);
                 assert!(count > 0);
-                let yields = executor.num_driver_yields.load(Ordering::Relaxed);
+                let yields = executor.stats.borrow().driver_yields;
                 assert!(yields > 0);
                 // we have yielded at most half the time (in practice much
                 // much less)
@@ -1070,5 +1214,151 @@ mod tests {
             let result = handle.await;
             assert_eq!(result, Ok(42));
         });
+    }
+
+    #[tokio::test]
+    async fn test_force_shutdown() {
+        // verify happy path - shutdown returns a handle that is awaitable
+        // also spawns aren't allowed after shutdown
+        // and when using force shutdown, all tasks are cancelled
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let executor =
+                    Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                let executor_clone = executor.clone();
+                local.spawn_local(async move {
+                    executor_clone.run().await;
+                });
+                let counter = Arc::new(AtomicU32::new(0));
+                let counter_clone = counter.clone();
+                // spawn a task that runs forever
+                let task = executor
+                    .spawn(0, async move {
+                        loop {
+                            counter_clone.fetch_add(1, Ordering::Relaxed);
+                            sleep(Duration::from_millis(100)).await;
+                        }
+                    })
+                    .unwrap();
+                // sleep a bit to let the task start
+                sleep(Duration::from_millis(100)).await;
+                assert!(counter.load(Ordering::Relaxed) > 0);
+                assert_eq!(executor.num_live_tasks(), 1);
+                // shutdown with drain mode
+                let shutdown_handle = executor.shutdown(ShutdownMode::Force);
+                // can't spawn after shutdown
+                let result = executor.spawn(0, async move { 42 });
+                assert!(matches!(result.unwrap_err(), SpawnError::ShuttingDown));
+                // await shutdown handle
+                shutdown_handle.await;
+                // all tasks should be cancelled
+                assert_eq!(executor.num_live_tasks(), 0);
+                // and await on task works
+                let result = task.await;
+                assert!(matches!(result, Err(JoinError::Cancelled)));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_drain_timeout() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let executor =
+                    Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                let executor_clone = executor.clone();
+                local.spawn_local(async move {
+                    executor_clone.run().await;
+                });
+                let counter = Arc::new(AtomicU32::new(0));
+                let counter_clone = counter.clone();
+                // spawn a task that runs forever
+                let task = executor
+                    .spawn(0, async move {
+                        loop {
+                            counter_clone.fetch_add(1, Ordering::Relaxed);
+                            sleep(Duration::from_millis(100)).await;
+                        }
+                    })
+                    .unwrap();
+                // sleep a bit to let the task start
+                sleep(Duration::from_millis(100)).await;
+                let count = counter.load(Ordering::Relaxed);
+                assert!(count > 0);
+                assert_eq!(executor.num_live_tasks(), 1);
+                // shutdown with drain mode
+                let shutdown_handle =
+                    executor.shutdown(ShutdownMode::DrainFor(Duration::from_secs(1)));
+                // can't spawn after shutdown
+                let result = executor.spawn(0, async move { 42 });
+                assert!(matches!(result.unwrap_err(), SpawnError::ShuttingDown));
+                // sleep for 100 ms - task should still be running
+                sleep(Duration::from_millis(100)).await;
+                assert!(counter.load(Ordering::Relaxed) > count);
+                assert_eq!(executor.num_live_tasks(), 1);
+                // if we try to await shutdown or task handle with timeout,
+                // it should timeout
+                let result = timeout(Duration::from_millis(100), shutdown_handle.clone()).await;
+                assert!(result.is_err());
+                let result = timeout(Duration::from_millis(100), task.clone()).await;
+                assert!(result.is_err());
+                // but it should be done within 1 second
+                let result = timeout(Duration::from_secs(1), shutdown_handle).await;
+                assert!(result.is_ok());
+                assert_eq!(executor.num_live_tasks(), 0);
+                // and task should be cancelled
+                let result = timeout(Duration::from_millis(1), task).await;
+                let result = result.unwrap();
+                assert_eq!(result, Err(JoinError::Cancelled));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_drain_shutdown() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let executor =
+                    Executor::new(vec![Queue::new(0, 1, Box::new(FifoQueue::new()))]).unwrap();
+                let executor_clone = executor.clone();
+                local.spawn_local(async move {
+                    executor_clone.run().await;
+                });
+                let counter = Arc::new(AtomicU32::new(0));
+                let counter_clone = counter.clone();
+                // spawn a task that runs forever
+                let task = executor
+                    .spawn(0, async move {
+                        counter_clone.fetch_add(1, Ordering::Relaxed);
+                        sleep(Duration::from_millis(100)).await;
+                        counter_clone.fetch_add(1, Ordering::Relaxed);
+                        sleep(Duration::from_millis(100)).await;
+                        counter_clone.fetch_add(1, Ordering::Relaxed);
+                        42
+                    })
+                    .unwrap();
+                // wait just a bit to let the task start
+                sleep(Duration::from_millis(10)).await;
+                // verify task has started
+                assert_eq!(executor.num_live_tasks(), 1);
+                assert!(counter.load(Ordering::Relaxed) == 1);
+                // now initiate shutdown
+                let shutdown_handle = executor.shutdown(ShutdownMode::Drain);
+                // await shutdown handle
+                let result = timeout(Duration::from_secs(1), shutdown_handle.clone()).await;
+                assert!(result.is_ok());
+                // all tasks should be cancelled
+                assert_eq!(executor.num_live_tasks(), 0);
+                // more importantly though the task should have completed
+                assert_eq!(counter.load(Ordering::Relaxed), 3);
+                // now await on task should get the result immediately
+                let result = timeout(Duration::from_millis(1), task).await;
+                let result = result.unwrap();
+                assert_eq!(result, Ok(42));
+            })
+            .await;
     }
 }

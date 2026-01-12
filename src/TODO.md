@@ -1,4 +1,4 @@
-1) Add shutdown to runtime
+<!-- 1) Add shutdown to runtime -->
 2) Add couple more schedulers e.g. SRTF
 <!-- 3) Add tests that verify it can work with other runtimes -->
 <!-- 4) Change class from i32 -> u8, don't use hashmap but vec<option<queue>> -->
@@ -11,3 +11,7 @@
 10) Enable LIFO optimization in some cases?
 <!-- 11) Add yield_maybe -->
 12) Add test to verify bad executor can't be created (0 shares, duplicate ID)
+13) Add test to verify that panic on task causes the whole thread to panic
+14) Make key system generic over Eq + Sized
+15) Add arrival_time and root_arrival_time per task, send to enqueue. Or should
+    we add parent_taskid?

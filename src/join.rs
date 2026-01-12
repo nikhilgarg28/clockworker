@@ -11,7 +11,9 @@ use std::{
 #[derive(Debug, PartialEq)]
 pub enum JoinError {
     Cancelled,
+    ResultTaken,
 }
+#[derive(Debug)]
 pub struct JoinState<T> {
     done: std::sync::atomic::AtomicBool,
     // Stored exactly once by the winner; guarded by state.
@@ -65,11 +67,15 @@ impl<T> JoinState<T> {
     /// Consumes the result exactly once.
     fn take_result(&self) -> Result<T, JoinError> {
         let mut g = self.result.lock().unwrap();
-        g.take().expect("JoinState done but result missing")
+        if g.is_none() {
+            return Err(JoinError::ResultTaken);
+        }
+        g.take().unwrap()
     }
 }
 
 /// A JoinHandle that detaches on drop, and supports explicit abort().
+#[derive(Clone, Debug)]
 pub struct JoinHandle<T> {
     header: Arc<TaskHeader>,
     join: Arc<JoinState<T>>,

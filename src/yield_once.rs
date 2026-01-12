@@ -4,6 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
+/// Future that yields control to the outer runtime once
 pub struct YieldOnce(bool);
 
 pub fn yield_once() -> YieldOnce {
