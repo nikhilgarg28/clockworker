@@ -15,4 +15,6 @@
 <!-- 14) Make key system generic over Eq + Sized -->
 <!-- 15) Add arrival_time and root_arrival_time per task, send to enqueue. Or should
     we add parent_taskid? -->
-16) dont' make spawn return error - if not accepting, make tasks canceled
+<!-- 16) dont' make spawn return error - if not accepting, make tasks canceled -->
+17) Option to enable stats
+18) Configuration builder (e.g. sched_latency etc.)
