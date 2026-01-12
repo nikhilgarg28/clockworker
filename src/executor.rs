@@ -208,7 +208,7 @@ impl<K: QueueKey> QueueHandle<K> {
             hash: Some(NonZeroU64::new(hash).unwrap()),
         }
     }
-    pub fn spawn<T, F>(self: &Self, fut: F) -> Result<JoinHandle<T, K>, SpawnError<K>>
+    pub fn spawn<T, F>(self: &Self, fut: F) -> JoinHandle<T, K>
     where
         T: 'static,
         F: Future<Output = T> + 'static, // !Send ok
@@ -296,14 +296,6 @@ impl<K: QueueKey> Executor<K> {
         }))
     }
 
-    fn ensure_accepting(self: &Rc<Self>) -> Result<(), SpawnError<K>> {
-        if self.shutdown.accepting.get() {
-            Ok(())
-        } else {
-            Err(SpawnError::ShuttingDown)
-        }
-    }
-
     fn should_force_now(&self, now: Instant) -> bool {
         match self.shutdown.requested.get() {
             None => false,
@@ -336,28 +328,27 @@ impl<K: QueueKey> Executor<K> {
     }
 
     /// Internal method to spawn a task onto a queue.
-    fn spawn_inner<T, F>(
-        self: &Rc<Self>,
-        qid: K,
-        group: u64,
-        fut: F,
-    ) -> Result<JoinHandle<T, K>, SpawnError<K>>
+    fn spawn_inner<T, F>(self: &Rc<Self>, qid: K, group: u64, fut: F) -> JoinHandle<T, K>
     where
         T: 'static,
         F: Future<Output = T> + 'static, // !Send ok
     {
-        let join = Arc::new(JoinState::<T>::new());
-
-        let mut tasks = self.tasks.borrow_mut();
         let qid = qid.into();
         assert!(self.qids.borrow().iter().position(|q| *q == qid).is_some());
-        self.ensure_accepting()?;
+        let mut tasks = self.tasks.borrow_mut();
         let entry = tasks.vacant_entry();
         let id = entry.key();
         let header = Arc::new(TaskHeader::new(id, qid, group, self.ingress_tx.clone()));
-
+        let join = Arc::new(JoinState::<T>::new());
         // Wrap user future to publish result into JoinState.
         let wrapped = CancelableFuture::new(header.clone(), join.clone(), fut);
+
+        // if not accepting, don't enqueue, must mark cancelled
+        if !self.shutdown.accepting.get() {
+            let cancelled = join.try_complete_cancelled();
+            assert!(cancelled);
+            return JoinHandle::new(header, join);
+        }
 
         entry.insert(TaskRecord {
             header: header.clone(),
@@ -369,7 +360,7 @@ impl<K: QueueKey> Executor<K> {
         // Enqueue initially.
         header.enqueue();
 
-        Ok(JoinHandle::new(header, join))
+        JoinHandle::new(header, join)
     }
 
     /// Drain ingress notifications and route runnable tasks into their class policies.
@@ -735,11 +726,9 @@ mod tests {
 
                 let counter_clone = counter.clone();
                 let queue = executor.queue(0).unwrap();
-                let handle = queue
-                    .spawn(async move {
-                        counter_clone.fetch_add(1, Ordering::Relaxed);
-                    })
-                    .unwrap();
+                let handle = queue.spawn(async move {
+                    counter_clone.fetch_add(1, Ordering::Relaxed);
+                });
 
                 // Run executor in background
                 let executor_clone = executor.clone();
@@ -771,7 +760,7 @@ mod tests {
                     executor_clone.run().await;
                 });
 
-                let result = timeout(Duration::from_millis(100), handle.unwrap()).await;
+                let result = timeout(Duration::from_millis(100), handle).await;
                 assert!(result.is_ok(), "JoinHandle should complete");
                 let join_result = result.unwrap();
                 assert_eq!(join_result, Ok(42));
@@ -792,16 +781,14 @@ mod tests {
                 let started_clone = started.clone();
                 let completed_clone = completed.clone();
                 let queue = executor.queue(0).unwrap();
-                let handle = queue
-                    .spawn(async move {
-                        started_clone.store(true, Ordering::Relaxed);
-                        // Task that runs for a while
-                        for _ in 0..100 {
-                            sleep(Duration::from_millis(10)).await;
-                        }
-                        completed_clone.store(true, Ordering::Relaxed);
-                    })
-                    .unwrap();
+                let handle = queue.spawn(async move {
+                    started_clone.store(true, Ordering::Relaxed);
+                    // Task that runs for a while
+                    for _ in 0..100 {
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                    completed_clone.store(true, Ordering::Relaxed);
+                });
 
                 let executor_clone = executor.clone();
                 local.spawn_local(async move {
@@ -887,8 +874,8 @@ mod tests {
                     high_count,
                     low_count
                 );
-                handle1.unwrap().abort();
-                handle2.unwrap().abort();
+                handle1.abort();
+                handle2.abort();
             })
             .await;
     }
@@ -958,7 +945,7 @@ mod tests {
 
                 // Wait for all tasks to complete
                 for handle in handles {
-                    let result = timeout(Duration::from_millis(100), handle.unwrap()).await;
+                    let result = timeout(Duration::from_millis(100), handle).await;
                     assert!(result.is_ok(), "All tasks should complete");
                 }
 
@@ -993,7 +980,7 @@ mod tests {
                 // Give executor time to start
                 sleep(Duration::from_millis(10)).await;
 
-                let result = timeout(Duration::from_millis(500), handle.unwrap()).await;
+                let result = timeout(Duration::from_millis(500), handle).await;
                 assert!(
                     result.is_ok(),
                     "Task with yields should complete, got {:?}",
@@ -1102,11 +1089,9 @@ mod tests {
                 let executed = Arc::new(AtomicBool::new(false));
 
                 let executed_clone = executed.clone();
-                let handle = queue
-                    .spawn(async move {
-                        executed_clone.store(true, Ordering::Relaxed);
-                    })
-                    .unwrap();
+                let handle = queue.spawn(async move {
+                    executed_clone.store(true, Ordering::Relaxed);
+                });
 
                 // Abort immediately before executor runs
                 handle.abort();
@@ -1236,18 +1221,16 @@ mod tests {
                 });
                 let counter1 = Arc::new(AtomicU32::new(0));
                 let counter1_clone = counter1.clone();
-                let handle = queue
-                    .spawn(async move {
-                        let mut i = 0;
-                        loop {
-                            counter1_clone.fetch_add(1, Ordering::Relaxed);
-                            if i % 1000 == 0 {
-                                yield_maybe().await;
-                            }
-                            i += 1;
+                let handle = queue.spawn(async move {
+                    let mut i = 0;
+                    loop {
+                        counter1_clone.fetch_add(1, Ordering::Relaxed);
+                        if i % 1000 == 0 {
+                            yield_maybe().await;
                         }
-                    })
-                    .unwrap();
+                        i += 1;
+                    }
+                });
                 sleep(Duration::from_millis(100)).await;
                 let count = counter1.load(Ordering::Relaxed);
                 assert!(count > 0);
@@ -1273,7 +1256,7 @@ mod tests {
         });
         let h2 = smol_local_ex.spawn(async move {
             let queue = executor.queue(0).unwrap();
-            let handle = queue.spawn(async move { 42 }).unwrap();
+            let handle = queue.spawn(async move { 42 });
             handle.await
         });
 
@@ -1299,12 +1282,10 @@ mod tests {
                 let counter = Arc::new(AtomicU32::new(0));
                 let counter_clone = counter.clone();
                 let queue = executor.queue(0).unwrap();
-                let handle = queue
-                    .spawn(async move {
-                        counter_clone.fetch_add(1, Ordering::Relaxed);
-                        42
-                    })
-                    .unwrap();
+                let handle = queue.spawn(async move {
+                    counter_clone.fetch_add(1, Ordering::Relaxed);
+                    42
+                });
                 sleep(Duration::from_millis(100)).await;
                 assert_eq!(counter.load(Ordering::Relaxed), 1);
                 // task is done but abort should still work - no-op
@@ -1330,12 +1311,10 @@ mod tests {
 
             let counter_clone = counter.clone();
             let queue = executor.queue(0).unwrap();
-            let handle = queue
-                .spawn(async move {
-                    counter_clone.fetch_add(1, Ordering::Relaxed);
-                    42
-                })
-                .unwrap();
+            let handle = queue.spawn(async move {
+                counter_clone.fetch_add(1, Ordering::Relaxed);
+                42
+            });
 
             // initial value should be 0
             assert_eq!(counter.load(Ordering::Relaxed), 0);
@@ -1370,14 +1349,12 @@ mod tests {
                 let counter_clone = counter.clone();
                 // spawn a task that runs forever
                 let queue = executor.queue(0).unwrap();
-                let task = queue
-                    .spawn(async move {
-                        loop {
-                            counter_clone.fetch_add(1, Ordering::Relaxed);
-                            sleep(Duration::from_millis(100)).await;
-                        }
-                    })
-                    .unwrap();
+                let task = queue.spawn(async move {
+                    loop {
+                        counter_clone.fetch_add(1, Ordering::Relaxed);
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                });
                 // sleep a bit to let the task start
                 sleep(Duration::from_millis(100)).await;
                 assert!(counter.load(Ordering::Relaxed) > 0);
@@ -1387,7 +1364,10 @@ mod tests {
                 // can't spawn after shutdown
                 let queue = executor.queue(0).unwrap();
                 let result = queue.spawn(async move { 42 });
-                assert!(matches!(result.unwrap_err(), SpawnError::ShuttingDown));
+                // this should be cancelled immediately
+                let result = timeout(Duration::from_millis(1), result).await;
+                assert!(result.is_ok());
+                assert!(matches!(result.unwrap(), Err(JoinError::Cancelled)));
                 // await shutdown handle
                 shutdown_handle.await;
                 // all tasks should be cancelled
@@ -1414,14 +1394,12 @@ mod tests {
                 let counter_clone = counter.clone();
                 // spawn a task that runs forever
                 let queue = executor.queue(0).unwrap();
-                let task = queue
-                    .spawn(async move {
-                        loop {
-                            counter_clone.fetch_add(1, Ordering::Relaxed);
-                            sleep(Duration::from_millis(100)).await;
-                        }
-                    })
-                    .unwrap();
+                let task = queue.spawn(async move {
+                    loop {
+                        counter_clone.fetch_add(1, Ordering::Relaxed);
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                });
                 // sleep a bit to let the task start
                 sleep(Duration::from_millis(100)).await;
                 let count = counter.load(Ordering::Relaxed);
@@ -1433,7 +1411,10 @@ mod tests {
                 // can't spawn after shutdown
                 let queue = executor.queue(0).unwrap();
                 let result = queue.spawn(async move { 42 });
-                assert!(matches!(result.unwrap_err(), SpawnError::ShuttingDown));
+                // join handle should be cancelled immediately
+                let result = timeout(Duration::from_millis(1), result).await;
+                assert!(result.is_ok());
+                assert!(matches!(result.unwrap(), Err(JoinError::Cancelled)));
                 // sleep for 100 ms - task should still be running
                 sleep(Duration::from_millis(100)).await;
                 assert!(counter.load(Ordering::Relaxed) > count);
@@ -1471,16 +1452,14 @@ mod tests {
                 let counter_clone = counter.clone();
                 // spawn a task that runs forever
                 let queue = executor.queue(0).unwrap();
-                let task = queue
-                    .spawn(async move {
-                        counter_clone.fetch_add(1, Ordering::Relaxed);
-                        sleep(Duration::from_millis(100)).await;
-                        counter_clone.fetch_add(1, Ordering::Relaxed);
-                        sleep(Duration::from_millis(100)).await;
-                        counter_clone.fetch_add(1, Ordering::Relaxed);
-                        42
-                    })
-                    .unwrap();
+                let task = queue.spawn(async move {
+                    counter_clone.fetch_add(1, Ordering::Relaxed);
+                    sleep(Duration::from_millis(100)).await;
+                    counter_clone.fetch_add(1, Ordering::Relaxed);
+                    sleep(Duration::from_millis(100)).await;
+                    counter_clone.fetch_add(1, Ordering::Relaxed);
+                    42
+                });
                 // wait just a bit to let the task start
                 sleep(Duration::from_millis(10)).await;
                 // verify task has started
