@@ -330,9 +330,13 @@ pub struct Executor<K: QueueKey> {
     options: ExecutorOptions,
     ingress_tx: Sender<TaskId>,
     ingress_rx: Receiver<TaskId>,
+    shutdown_tx: Sender<()>,
+    shutdown_rx: Receiver<()>,
 
     /// Number of live tasks known to the executor.
     live_tasks: std::sync::atomic::AtomicUsize,
+    /// Whether run() has been called at least once.
+    run_started: std::sync::atomic::AtomicBool,
 
     shutdown: Rc<ShutdownState>,
 
@@ -368,6 +372,7 @@ impl<K: QueueKey> Executor<K> {
         }
 
         let (tx, rx) = flume::unbounded::<TaskId>();
+        let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
 
         let qids = queues.iter().map(|q| q.id()).collect::<Vec<_>>();
         let queues = queues
@@ -378,11 +383,14 @@ impl<K: QueueKey> Executor<K> {
         Ok(Rc::new(Self {
             ingress_tx: tx,
             ingress_rx: rx,
+            shutdown_tx,
+            shutdown_rx,
             tasks: RefCell::new(Slab::new()),
             queues: RefCell::new(queues),
             shutdown: Rc::new(ShutdownState::new()),
             qids: RefCell::new(qids),
             live_tasks: std::sync::atomic::AtomicUsize::new(0),
+            run_started: std::sync::atomic::AtomicBool::new(false),
             options,
             min_vruntime: std::cell::Cell::new(0),
             stats: RefCell::new(ExecutorStats::new(Instant::now())),
@@ -566,7 +574,23 @@ impl<K: QueueKey> Executor<K> {
     /// Run the executor loop forever.
     ///
     /// Panic behavior: if any task panics while being polled, the executor panics (propagates).
+    ///
+    /// If the executor has already been shutdown, this method returns immediately.
     pub async fn run(&self) -> () {
+        // Check if already stopped (e.g., shutdown was called before run())
+        if self.shutdown.stopped.get() {
+            return;
+        }
+
+        // Mark that run() has been called
+        self.run_started.store(true, Ordering::Release);
+
+        // Check if shutdown was already requested before run() was called
+        if self.shutdown.requested() && self.num_live_tasks() == 0 {
+            self.shutdown.mark_stopped_and_wake_waiters();
+            return;
+        }
+
         let mut last_driver_yield_at = Instant::now();
 
         loop {
@@ -583,7 +607,12 @@ impl<K: QueueKey> Executor<K> {
 
             // Select next queue to run
             let Some((qidx, timeslice)) = self.select_queue() else {
-                // Nothing runnable - wait for tasks
+                // Nothing runnable - check shutdown before waiting
+                if self.shutdown.requested() && self.num_live_tasks() == 0 {
+                    self.shutdown.mark_stopped_and_wake_waiters();
+                    break;
+                }
+                // Wait for tasks
                 let more = self.wait_for_tasks(now).await;
                 if !more {
                     break;
@@ -619,19 +648,48 @@ impl<K: QueueKey> Executor<K> {
     /// Returns true if we should continue the loop, false if we should break.
     async fn wait_for_tasks(&self, now: Instant) -> bool {
         let idle_start = Instant::now();
-        let recv = self.ingress_rx.recv_async().await;
-        let idle_end = Instant::now();
-        let idle_duration = idle_end.duration_since(idle_start);
-        self.stats.borrow_mut().idle_ns += idle_duration.as_nanos();
 
-        match recv {
-            Ok(id) => {
-                self.enqueue_task(id, now);
-                true // Continue loop
+        // Use select to race between ingress and shutdown channels
+        use futures::future::Either;
+        use futures::FutureExt;
+
+        let ingress_fut = self.ingress_rx.recv_async().fuse();
+        let shutdown_fut = self.shutdown_rx.recv_async().fuse();
+
+        let mut ingress_pinned = std::pin::pin!(ingress_fut);
+        let mut shutdown_pinned = std::pin::pin!(shutdown_fut);
+
+        match futures::future::select(ingress_pinned.as_mut(), shutdown_pinned.as_mut()).await {
+            Either::Left((result, _)) => {
+                let idle_end = Instant::now();
+                let idle_duration = idle_end.duration_since(idle_start);
+                self.stats.borrow_mut().idle_ns += idle_duration.as_nanos();
+
+                match result {
+                    Ok(id) => {
+                        self.enqueue_task(id, now);
+                        true // Continue loop
+                    }
+                    Err(_) => {
+                        // Sender dropped + no pending items => we're done
+                        false // Break loop
+                    }
+                }
             }
-            Err(_) => {
-                // Sender dropped + no pending items => we're done
-                false // Break loop
+            Either::Right((_, _)) => {
+                // Shutdown signal received
+                let idle_end = Instant::now();
+                let idle_duration = idle_end.duration_since(idle_start);
+                self.stats.borrow_mut().idle_ns += idle_duration.as_nanos();
+
+                // Check if we should actually shutdown (no live tasks)
+                if self.num_live_tasks() == 0 {
+                    self.shutdown.mark_stopped_and_wake_waiters();
+                    false // Break loop
+                } else {
+                    // Still have tasks, continue
+                    true // Continue loop
+                }
             }
         }
     }
@@ -779,6 +837,15 @@ impl<K: QueueKey> Executor<K> {
     pub fn shutdown(&self, mode: ShutdownMode) -> ShutdownHandle {
         self.shutdown.accepting.set(false);
         self.shutdown.request_shutdown(mode);
+
+        // If run() hasn't been called yet and there are no tasks, we can immediately mark as stopped
+        if !self.run_started.load(Ordering::Acquire) && self.num_live_tasks() == 0 {
+            self.shutdown.mark_stopped_and_wake_waiters();
+        } else {
+            // Wake up the executor if it's waiting
+            let _ = self.shutdown_tx.try_send(());
+        }
+
         ShutdownHandle::new(self.shutdown.clone())
     }
 }
@@ -1711,6 +1778,98 @@ mod tests {
                     executor.num_live_tasks(),
                     0,
                     "Task should be removed after panic"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_without_tasks() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let opts = ExecutorOptions::default();
+                let executor =
+                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
+                        .unwrap();
+                assert_eq!(executor.num_live_tasks(), 0);
+
+                // Start executor in background
+                let executor_clone = executor.clone();
+                local.spawn_local(async move {
+                    executor_clone.run().await;
+                });
+
+                // Give executor a moment to start
+                tokio::task::yield_now().await;
+
+                let shutdown_handle = executor.shutdown(ShutdownMode::Drain);
+                // do a timeout to ensure shutdown handle is awaitable
+                let result = timeout(Duration::from_millis(100), shutdown_handle).await;
+                assert!(result.is_ok());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_before_run() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let opts = ExecutorOptions::default();
+                let executor =
+                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
+                        .unwrap();
+                assert_eq!(executor.num_live_tasks(), 0);
+
+                // Call shutdown before run() is called
+                let shutdown_handle = executor.shutdown(ShutdownMode::Drain);
+
+                // Shutdown handle should complete immediately (without waiting for run())
+                let result = timeout(Duration::from_millis(100), shutdown_handle).await;
+                assert!(
+                    result.is_ok(),
+                    "Shutdown should complete immediately when called before run()"
+                );
+
+                // Now start executor - it should exit immediately since already shutdown
+                let executor_clone = executor.clone();
+                local.spawn_local(async move {
+                    executor_clone.run().await;
+                });
+
+                // Give executor a moment to exit
+                tokio::task::yield_now().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_run_after_shutdown() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let opts = ExecutorOptions::default();
+                let executor =
+                    Executor::new(opts, vec![Queue::new(0, 1, Box::new(RunnableFifo::new()))])
+                        .unwrap();
+                assert_eq!(executor.num_live_tasks(), 0);
+
+                // Shutdown the executor
+                let shutdown_handle = executor.shutdown(ShutdownMode::Drain);
+                let _ = timeout(Duration::from_millis(100), shutdown_handle).await;
+
+                // Now try to run - it should exit immediately
+                let executor_clone = executor.clone();
+                let run_handle = local.spawn_local(async move {
+                    executor_clone.run().await;
+                });
+
+                // Run should complete immediately
+                let result = timeout(Duration::from_millis(100), run_handle).await;
+                assert!(
+                    result.is_ok(),
+                    "run() should complete immediately after shutdown"
                 );
             })
             .await;
