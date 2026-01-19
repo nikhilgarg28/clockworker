@@ -59,7 +59,7 @@ The simplest example - spawn a task and wait for it:
 use clockworker::{ExecutorBuilder, LAS};
 use tokio::task::LocalSet;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let local = LocalSet::new();
     local.run_until(async {
@@ -106,7 +106,7 @@ enum Queue {
     Background,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let local = LocalSet::new();
     local.run_until(async {
@@ -171,7 +171,7 @@ use clockworker::{ExecutorBuilder, LAS};
 use tokio::task::LocalSet;
 use tokio::time::{sleep, Duration};
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let local = LocalSet::new();
     local.run_until(async {
@@ -216,7 +216,7 @@ as Tokio's single-threaded runtime). However, this can be configured:
 use clockworker::{ExecutorBuilder, LAS, JoinError};
 use tokio::task::LocalSet;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let local = LocalSet::new();
     local.run_until(async {
@@ -258,7 +258,7 @@ spawns many child tasks and you want to make lineage-aware scheduling choices.
 use clockworker::{ExecutorBuilder, LAS};
 use tokio::task::LocalSet;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let local = LocalSet::new();
     local.run_until(async {
@@ -289,9 +289,12 @@ async fn main() {
 **Use LAS when you need low latency and fair scheduling:**
 
 ```rust
-ExecutorBuilder::new()
+use clockworker::{ExecutorBuilder, LAS};
+
+let _executor = ExecutorBuilder::new()
     .with_queue(0, 1, LAS::new())
     .build()
+    .unwrap();
 ```
 
 LAS prioritizes tasks that have received the least CPU time, which helps ensure:
@@ -304,11 +307,12 @@ LAS prioritizes tasks that have received the least CPU time, which helps ensure:
 **Use RunnableFifo for simple FIFO ordering:**
 
 ```rust
-use clockworker::RunnableFifo;
+use clockworker::{ExecutorBuilder, RunnableFifo};
 
-ExecutorBuilder::new()
+let _executor = ExecutorBuilder::new()
     .with_queue(0, 1, RunnableFifo::new())
     .build()
+    .unwrap();
 ```
 
 Tasks are ordered by when they become runnable (not arrival time). If a task goes to sleep and wakes up, it goes to the back of the queue.
@@ -318,13 +322,13 @@ Tasks are ordered by when they become runnable (not arrival time). If a task goe
 **Use ArrivalFifo for strict arrival-time ordering:**
 
 ```rust
-use clockworker::ArrivalFifo;
+use clockworker::{ExecutorBuilder, ArrivalFifo};
 
-ExecutorBuilder::new()
+let _executor = ExecutorBuilder::new()
     .with_queue(0, 1, ArrivalFifo::new())
     .build()
+    .unwrap();
 ```
-
 Tasks maintain their position based on when they were first spawned, even if they go to sleep.
 
 ## Architecture
