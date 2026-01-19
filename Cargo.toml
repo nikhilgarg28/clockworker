@@ -1,5 +1,5 @@
 [package]
-name = "clockwork"
+name = "clockworker"
 version = "0.1.0"
 edition = "2021"
 description = "A single-threaded async executor with EEVDF-based fair scheduling and pluggable task schedulers"

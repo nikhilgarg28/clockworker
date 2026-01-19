@@ -1,28 +1,28 @@
-# Clockwork
+# Clockworker
 
-Clockwork, loosely inspired by Seastar, is a single-threaded async executor
-with powerful, pluggable scheduling. Clockwork is agnostic to the underlying
+Clockworker, loosely inspired by Seastar, is a single-threaded async executor
+with powerful, pluggable scheduling. Clockworker is agnostic to the underlying
 async runtime and can sit on top of any runtime like Tokio, Monoio, or Smol.
 
 **⚠️ Early/Alpha Release**: This project is in early development. APIs may change in breaking ways between versions. Use at your own risk.
 
-## What is Clockwork for?
+## What is Clockworker for?
 
 There is a class of settings where single-threaded async runtimes are a great fit.
 Several such runtimes exist in the Rust ecosystem—Tokio, Monoio, Glommio, etc. But
 almost none of these (with the exception of Glommio) provide the ability to run
 multiple configurable work queues with different priorities. This becomes important
 for many real-world single-threaded systems, at minimum to separate foreground and
-background work. Clockwork aims to solve this problem.
+background work. Clockworker aims to solve this problem.
 
 It does so via work queues with configurable time-shares onto which tasks can be
-spawned. Clockwork has a two-level scheduler: the top-level scheduler chooses the
+spawned. Clockworker has a two-level scheduler: the top-level scheduler chooses the
 queue to poll based on its fair time share (inspired by Linux CFS/EEVDF), and then
 a task is chosen from that queue based on a queue-specific scheduler, which is
 fully pluggable—you can use one of the built-in schedulers or write your own by
 implementing a simple trait.
 
-Note that Clockwork itself is just an executor loop, not a full async runtime, and
+Note that Clockworker itself is just an executor loop, not a full async runtime, and
 is designed to sit on top of any other runtime. 
 
 ## Features
@@ -46,7 +46,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-clockwork = "0.1.0"
+clockworker = "0.1.0"
 ```
 
 ## Examples
@@ -56,7 +56,7 @@ clockwork = "0.1.0"
 The simplest example - spawn a task and wait for it:
 
 ```rust
-use clockwork::{ExecutorBuilder, LAS};
+use clockworker::{ExecutorBuilder, LAS};
 use tokio::task::LocalSet;
 
 #[tokio::main]
@@ -79,7 +79,7 @@ async fn main() {
 
         // Spawn a task
         let handle = queue.spawn(async {
-            println!("Hello from clockwork!");
+            println!("Hello from clockworker!");
             42
         });
 
@@ -95,7 +95,7 @@ async fn main() {
 Allocate CPU time proportionally between queues:
 
 ```rust
-use clockwork::{ExecutorBuilder, LAS, yield_maybe};
+use clockworker::{ExecutorBuilder, LAS, yield_maybe};
 use tokio::task::LocalSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -159,7 +159,7 @@ async fn main() {
 Cancel tasks using `JoinHandle::abort()`:
 
 ```rust
-use clockwork::{ExecutorBuilder, LAS};
+use clockworker::{ExecutorBuilder, LAS};
 use tokio::task::LocalSet;
 use tokio::time::{sleep, Duration};
 
@@ -205,7 +205,7 @@ By default, the executor also panics when any of the tasks panic (same behavior
 as Tokio's single-threaded runtime). However, this can be configured:
 
 ```rust
-use clockwork::{ExecutorBuilder, LAS, JoinError};
+use clockworker::{ExecutorBuilder, LAS, JoinError};
 use tokio::task::LocalSet;
 
 #[tokio::main]
@@ -247,7 +247,7 @@ policies across tenants, gRPC streams, noisy clients, or even cases where a task
 spawns many child tasks and you want to make lineage-aware scheduling choices.
 
 ```rust
-use clockwork::{ExecutorBuilder, LAS};
+use clockworker::{ExecutorBuilder, LAS};
 use tokio::task::LocalSet;
 
 #[tokio::main]
@@ -296,7 +296,7 @@ LAS prioritizes tasks that have received the least CPU time, which helps ensure:
 **Use RunnableFifo for simple FIFO ordering:**
 
 ```rust
-use clockwork::RunnableFifo;
+use clockworker::RunnableFifo;
 
 ExecutorBuilder::new()
     .with_queue(0, 1, RunnableFifo::new())
@@ -310,7 +310,7 @@ Tasks are ordered by when they become runnable (not arrival time). If a task goe
 **Use ArrivalFifo for strict arrival-time ordering:**
 
 ```rust
-use clockwork::ArrivalFifo;
+use clockworker::ArrivalFifo;
 
 ExecutorBuilder::new()
     .with_queue(0, 1, ArrivalFifo::new())
@@ -321,7 +321,7 @@ Tasks maintain their position based on when they were first spawned, even if the
 
 ## Architecture
 
-Clockwork uses a two-level scheduling approach:
+Clockworker uses a two-level scheduling approach:
 
 1. **Queue-level scheduling (EEVDF)**: Fairly distributes CPU time between queues based on their weights using virtual runtime
 2. **Task-level scheduling (pluggable)**: Within each queue, a scheduler (LAS, RunnableFifo, etc.) chooses which task to run next
