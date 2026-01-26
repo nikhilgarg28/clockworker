@@ -1,8 +1,10 @@
 mod arrival_fifo;
 mod las;
+mod qlas;
 mod runnable_fifo;
 pub use arrival_fifo::ArrivalFifo;
 pub use las::LAS;
+pub use qlas::QLAS;
 pub use runnable_fifo::RunnableFifo;
 
 use crate::queue::TaskId;

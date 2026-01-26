@@ -56,7 +56,7 @@ clockworker = "0.1.0"
 The simplest example - spawn a task and wait for it:
 
 ```rust
-use clockworker::{ExecutorBuilder, LAS};
+use clockworker::{ExecutorBuilder, scheduler};
 use tokio::task::LocalSet;
 
 #[tokio::main(flavor = "current_thread")]
@@ -65,7 +65,7 @@ async fn main() {
     local.run_until(async {
         // Create executor with a single queue using LAS scheduler
         let executor = ExecutorBuilder::new()
-            .with_queue(0, 1, LAS::new())
+            .with_queue(0, 1, scheduler::LAS::new())
             .build()
             .unwrap();
 
@@ -95,7 +95,7 @@ async fn main() {
 Allocate CPU time proportionally between queues:
 
 ```rust
-use clockworker::{ExecutorBuilder, LAS, yield_maybe};
+use clockworker::{ExecutorBuilder, scheduler, yield_maybe};
 use tokio::task::LocalSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -116,8 +116,8 @@ async fn main() {
         // Note: Queue IDs can be enums (as shown here) or integers, strings, or any
         // type implementing QueueKey
         let executor = ExecutorBuilder::new()
-            .with_queue(Queue::Foreground, 8, LAS::new())  // High priority queue
-            .with_queue(Queue::Background, 1, LAS::new())  // Low priority queue
+            .with_queue(Queue::Foreground, 8, scheduler::LAS::new())  // High priority queue
+            .with_queue(Queue::Background, 1, scheduler::LAS::new())  // Low priority queue
             .build()
             .unwrap();
 
@@ -167,7 +167,7 @@ async fn main() {
 Cancel tasks using `JoinHandle::abort()`:
 
 ```rust
-use clockworker::{ExecutorBuilder, LAS};
+use clockworker::{ExecutorBuilder, scheduler};
 use tokio::task::LocalSet;
 use tokio::time::{sleep, Duration};
 
@@ -176,7 +176,7 @@ async fn main() {
     let local = LocalSet::new();
     local.run_until(async {
         let executor = ExecutorBuilder::new()
-            .with_queue(0, 1, LAS::new())
+            .with_queue(0, 1, scheduler::LAS::new())
             .build()
             .unwrap();
 
@@ -213,7 +213,7 @@ By default, the executor also panics when any of the tasks panic (same behavior
 as Tokio's single-threaded runtime). However, this can be configured:
 
 ```rust
-use clockworker::{ExecutorBuilder, LAS, JoinError};
+use clockworker::{ExecutorBuilder, scheduler, JoinError};
 use tokio::task::LocalSet;
 
 #[tokio::main(flavor = "current_thread")]
@@ -222,7 +222,7 @@ async fn main() {
     local.run_until(async {
         // Configure executor to catch panics instead of crashing
         let executor = ExecutorBuilder::new()
-            .with_queue(0, 1, LAS::new())
+            .with_queue(0, 1, scheduler::LAS::new())
             .with_panic_on_task_panic(false)  // Catch panics
             .build()
             .unwrap();
@@ -255,7 +255,7 @@ policies across tenants, gRPC streams, noisy clients, or even cases where a task
 spawns many child tasks and you want to make lineage-aware scheduling choices.
 
 ```rust
-use clockworker::{ExecutorBuilder, LAS};
+use clockworker::{ExecutorBuilder, scheduler};
 use tokio::task::LocalSet;
 
 #[tokio::main(flavor = "current_thread")]
@@ -263,7 +263,7 @@ async fn main() {
     let local = LocalSet::new();
     local.run_until(async {
         let executor = ExecutorBuilder::new()
-            .with_queue(0, 1, LAS::new())
+            .with_queue(0, 1, scheduler::LAS::new())
             .build()
             .unwrap();
 
@@ -286,13 +286,13 @@ async fn main() {
 
 ### LAS (Least Attained Service) - Recommended for Latency
 
-**Use LAS when you need low latency and fair scheduling:**
+**Use QLAS when you need low latency and fair scheduling:**
 
 ```rust
-use clockworker::{ExecutorBuilder, LAS};
+use clockworker::{ExecutorBuilder, scheduler::QLAS};
 
 let _executor = ExecutorBuilder::new()
-    .with_queue(0, 1, LAS::new())
+    .with_queue(0, 1, QLAS::new())
     .build()
     .unwrap();
 ```
@@ -307,7 +307,7 @@ LAS prioritizes tasks that have received the least CPU time, which helps ensure:
 **Use RunnableFifo for simple FIFO ordering:**
 
 ```rust
-use clockworker::{ExecutorBuilder, RunnableFifo};
+use clockworker::{ExecutorBuilder, scheduler::RunnableFifo};
 
 let _executor = ExecutorBuilder::new()
     .with_queue(0, 1, RunnableFifo::new())
@@ -322,7 +322,7 @@ Tasks are ordered by when they become runnable (not arrival time). If a task goe
 **Use ArrivalFifo for strict arrival-time ordering:**
 
 ```rust
-use clockworker::{ExecutorBuilder, ArrivalFifo};
+use clockworker::{ExecutorBuilder, scheduler::ArrivalFifo};
 
 let _executor = ExecutorBuilder::new()
     .with_queue(0, 1, ArrivalFifo::new())
