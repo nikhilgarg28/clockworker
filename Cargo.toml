@@ -60,6 +60,10 @@ harness = false
 name = "overhead_profile"
 harness = false
 
+[[bench]]
+name = "tcp"
+harness = false
+
 [profile.samply]
 inherits = "release"
 debug = true

@@ -51,6 +51,12 @@ impl<T> Mpsc<T> {
         self.len.load(Ordering::Acquire)
     }
 
+    /// Register a waker to be notified when items are enqueued.
+    /// Used by the executor to wait for tasks without allocating futures.
+    pub fn register_waker(&self, waker: &std::task::Waker) {
+        self.waker.register(waker);
+    }
+
     /// Non-async drain used by the executor's run loop.
     /// Returns number of items drained into `out`.
     pub fn try_drain<const N: usize>(&self, out: &mut [T; N]) -> usize {

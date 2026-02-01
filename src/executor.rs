@@ -7,8 +7,11 @@ use crate::{
     task::TaskHeader,
     yield_once::yield_once,
 };
+use futures::FutureExt;
+use futures_util::task::AtomicWaker;
 use slab::Slab;
 use static_assertions::assert_not_impl_any;
+use std::sync::atomic::AtomicBool;
 use std::{
     any::Any,
     cell::Cell,
@@ -252,6 +255,13 @@ impl<K: QueueKey> ExecutorBuilder<K> {
         self.options.panic_on_task_panic = panic_on_task_panic;
         self
     }
+    /// Set the maximum number of task polls before yielding to the driver.
+    /// This ensures I/O-heavy workloads don't starve the reactor.
+    /// Default is 32.
+    pub fn with_max_polls_per_yield(mut self, max_polls: u32) -> Self {
+        self.options.max_polls_per_yield = max_polls;
+        self
+    }
     pub fn build(self) -> Result<Rc<Executor<K>>, String> {
         Executor::new(self.options, self.queues)
     }
@@ -262,6 +272,9 @@ pub struct ExecutorOptions {
     min_slice: Duration,
     driver_yield: Duration,
     panic_on_task_panic: bool,
+    /// Maximum number of task polls before yielding to the driver.
+    /// This ensures I/O-heavy workloads don't starve the reactor.
+    max_polls_per_yield: u32,
 }
 impl Default for ExecutorOptions {
     fn default() -> Self {
@@ -270,6 +283,7 @@ impl Default for ExecutorOptions {
             min_slice: Duration::from_micros(100),
             driver_yield: Duration::from_micros(500),
             panic_on_task_panic: true,
+            max_polls_per_yield: 61, // same as tokio
         }
     }
 }
@@ -490,10 +504,6 @@ impl<K: QueueKey> Executor<K> {
     /// When the executor stops, pending tasks remain pending and will resume if `run_until`
     /// is called again (Tokio-like behavior).
     pub async fn run_until<F: Future>(&self, until: F) -> F::Output {
-        use futures::FutureExt;
-        use futures_util::task::AtomicWaker;
-        use std::sync::atomic::AtomicBool;
-
         let mut until_pinned = std::pin::pin!(until.fuse());
 
         // Flag that gets set when until's waker is called
@@ -562,63 +572,52 @@ impl<K: QueueKey> Executor<K> {
     }
 
     /// Wait for either a queue to receive a task or `until_woken` to be set.
+    /// This is a single poll_fn that registers on all wakers directly, avoiding allocations.
     async fn wait_for_work_or_signal(
         &self,
-        until_woken: &Arc<std::sync::atomic::AtomicBool>,
-        idle_waker: &Arc<futures_util::task::AtomicWaker>,
+        until_woken: &Arc<AtomicBool>,
+        idle_waker: &Arc<AtomicWaker>,
     ) {
-        use futures::future;
-        use futures::FutureExt;
         use futures_util::future::poll_fn;
 
-        let wait_queues = self.wait_for_any_queue().fuse();
-        let mut wait_queues_pinned = std::pin::pin!(wait_queues);
-
-        let wait_signal = poll_fn({
-            let until_woken = until_woken.clone();
-            let idle_waker = idle_waker.clone();
-            move |cx: &mut Context<'_>| -> Poll<()> {
-                if until_woken.load(Ordering::Acquire) {
-                    return Poll::Ready(());
-                }
-                idle_waker.register(cx.waker());
-                if until_woken.load(Ordering::Acquire) {
-                    return Poll::Ready(());
-                }
-                Poll::Pending
+        poll_fn(|cx| {
+            // Check if until was woken
+            if until_woken.load(Ordering::Acquire) {
+                return Poll::Ready(());
             }
-        })
-        .fuse();
-        let mut wait_signal_pinned = std::pin::pin!(wait_signal);
 
-        // Wait on either: queues getting tasks OR until_woken being set
-        future::select(wait_queues_pinned.as_mut(), wait_signal_pinned.as_mut()).await;
+            // Check if any queue has items
+            for mpsc in &self.queue_mpscs {
+                if !mpsc.is_empty() {
+                    return Poll::Ready(());
+                }
+            }
+
+            // Register our waker with idle_waker (for until_woken signal)
+            idle_waker.register(cx.waker());
+
+            // Register our waker with each queue's MPSC
+            for mpsc in &self.queue_mpscs {
+                mpsc.register_waker(cx.waker());
+            }
+
+            // Re-check after registration to avoid missed wakeups
+            if until_woken.load(Ordering::Acquire) {
+                return Poll::Ready(());
+            }
+            for mpsc in &self.queue_mpscs {
+                if !mpsc.is_empty() {
+                    return Poll::Ready(());
+                }
+            }
+
+            Poll::Pending
+        })
+        .await
     }
 
     fn num_live_tasks(&self) -> usize {
         self.queue_mpscs.iter().map(|mpsc| mpsc.len()).sum()
-    }
-
-    /// Wait for new tasks if nothing is runnable.
-    /// Parks until any queue receives a new task.
-    async fn wait_for_any_queue(&self) {
-        use futures::future;
-        use futures::FutureExt;
-
-        // Create a wait future for each queue, box and pin them
-        let mut queue_futures: Vec<_> = self
-            .queue_mpscs
-            .iter()
-            .map(|mpsc| {
-                let fut = mpsc.wait().fuse();
-                Box::pin(fut) as Pin<Box<dyn Future<Output = ()> + '_>>
-            })
-            .collect();
-
-        // Wait for ANY queue to become non-empty
-        // This completes as soon as any queue transitions from empty to non-empty
-        // Items remain in the queue for the scheduler to drain
-        future::select_all(&mut queue_futures).await;
     }
 
     /// Select the next queue to run and measure the decision time.
@@ -643,15 +642,9 @@ impl<K: QueueKey> Executor<K> {
             let mut queues = self.queues.borrow_mut();
             let queue = &mut queues[qidx];
             // Check if queue was runnable before pop (to detect when it becomes runnable)
-            let was_runnable = queue.scheduler.is_runnable();
             queue.stats.record_runnable_dequeue();
             let maybe_id = queue.scheduler.pop();
 
-            // If queue just became runnable (wasn't runnable but now has a task), update vruntime
-            if !was_runnable && maybe_id.is_some() {
-                queue.vruntime = queue.vruntime.max(self.min_vruntime.get());
-                queue.stats.record_runnable_enqueue(true, Instant::now());
-            }
             drop(queues);
 
             let Some(id) = maybe_id else {
@@ -781,6 +774,8 @@ impl<K: QueueKey> Executor<K> {
         }
 
         let mut start = now;
+        let mut polls_this_slice = 0u32;
+        let max_polls = self.options.max_polls_per_yield;
 
         loop {
             set_yield_maybe_deadline(until);
@@ -798,6 +793,13 @@ impl<K: QueueKey> Executor<K> {
                 self.record_task_pending(id, group, qidx, start, end);
             }
             start = end;
+            polls_this_slice += 1;
+
+            // Yield to driver after max_polls_per_yield polls to let reactor process I/O
+            if polls_this_slice >= max_polls {
+                break;
+            }
+
             if end > until {
                 if enable_stats {
                     self.stats.borrow_mut().record_poll(elapsed, true);
