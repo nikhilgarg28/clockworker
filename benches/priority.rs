@@ -1,13 +1,23 @@
 mod utils;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use tabled::Table;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use utils::{Metrics, Step, Work};
+
+// Cache core IDs at startup to avoid issues with affinity changes
+static CORE_IDS: OnceLock<Vec<core_affinity::CoreId>> = OnceLock::new();
+
+fn get_cached_core_ids() -> &'static Vec<core_affinity::CoreId> {
+    CORE_IDS.get_or_init(|| {
+        core_affinity::get_core_ids().unwrap_or_default()
+    })
+}
 
 // ============================================================================
 // Configuration
@@ -32,10 +42,6 @@ impl Default for PriorityBenchmarkSpec {
     }
 }
 
-// Track actual CPU time spent in work
-static BACKGROUND_CPU_TIME_NS: AtomicU64 = AtomicU64::new(0);
-static FOREGROUND_CPU_TIME_NS: AtomicU64 = AtomicU64::new(0);
-
 // ============================================================================
 // Background Work Tracking
 // ============================================================================
@@ -46,8 +52,6 @@ static BACKGROUND_ITERATIONS: AtomicU64 = AtomicU64::new(0);
 
 fn reset_counters() {
     BACKGROUND_ITERATIONS.store(0, Ordering::SeqCst);
-    BACKGROUND_CPU_TIME_NS.store(0, Ordering::SeqCst);
-    FOREGROUND_CPU_TIME_NS.store(0, Ordering::SeqCst);
 }
 
 fn get_background_iterations() -> u64 {
@@ -74,16 +78,15 @@ fn generate_foreground_work(rng: &mut impl Rng) -> Work {
 }
 
 /// Run background work in a loop until shutdown signal
-async fn background_loop(shutdown: Arc<AtomicBool>) {
+async fn background_loop(shutdown: Arc<AtomicBool>, rng: &mut impl Rng) {
     while !shutdown.load(Ordering::Relaxed) {
-        let cpu_start = Instant::now();
+        let cpu = rng.gen_range(100..=500);
+        let io = rng.gen_range(100..=500);
         let work = Work::new(vec![
-            Step::CPU(Duration::from_micros(100)),
-            Step::Sleep(Duration::from_micros(100)),
+            Step::CPU(Duration::from_micros(cpu)),
+            Step::Sleep(Duration::from_micros(io)),
         ]);
         work.run().await;
-        let cpu_time = cpu_start.elapsed().as_nanos();
-        BACKGROUND_CPU_TIME_NS.fetch_add(cpu_time as u64, Ordering::Relaxed);
         BACKGROUND_ITERATIONS.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -132,12 +135,9 @@ fn generate_foreground_tasks(tx: flume::Sender<ForegroundTask>, count: usize, rp
 pub fn benchmark_clockworker(spec: PriorityBenchmarkSpec) -> BenchmarkResult {
     reset_counters();
     let (tx, rx) = flume::unbounded();
-    let target_core = core_affinity::get_core_ids()
-        .and_then(|cores| cores.into_iter().next())
-        .unwrap();
-    let other_core = core_affinity::get_core_ids()
-        .and_then(|cores| cores.into_iter().nth(1))
-        .unwrap();
+    let cores = get_cached_core_ids();
+    let target_core = cores.first().copied().unwrap();
+    let other_core = cores.get(1).copied().unwrap();
 
     let gen_handle = {
         let count = spec.foreground_count;
@@ -171,10 +171,12 @@ pub fn benchmark_clockworker(spec: PriorityBenchmarkSpec) -> BenchmarkResult {
                     let executor_clone = executor.clone();
                     let result = executor_clone
                         .run_until(async move {
+                            let rng = StdRng::seed_from_u64(0xC0FFEE);
                             for _ in 0..spec.background_count {
                                 let shutdown = shutdown.clone();
+                                let mut rng = rng.clone();
                                 executor.queue(1).unwrap().spawn(async move {
-                                    background_loop(shutdown).await;
+                                    background_loop(shutdown, &mut rng).await;
                                 });
                             }
                             let handle = executor
@@ -185,13 +187,9 @@ pub fn benchmark_clockworker(spec: PriorityBenchmarkSpec) -> BenchmarkResult {
                                     while let Ok(task) = rx.recv_async().await {
                                         let handle = executor.queue(0).unwrap().spawn(async move {
                                             let start_time = Instant::now();
-                                            let cpu_start = Instant::now();
                                             let queue_delay =
                                                 start_time.duration_since(task.submit_time);
                                             task.work.run().await;
-                                            let cpu_time = cpu_start.elapsed().as_nanos();
-                                            FOREGROUND_CPU_TIME_NS
-                                                .fetch_add(cpu_time as u64, Ordering::Relaxed);
                                             let total_latency = task.submit_time.elapsed();
                                             (queue_delay, total_latency)
                                         });
@@ -240,12 +238,9 @@ pub fn benchmark_tokio_single(spec: PriorityBenchmarkSpec) -> BenchmarkResult {
 
     let (tx, rx) = flume::unbounded();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let target_core = core_affinity::get_core_ids()
-        .and_then(|cores| cores.into_iter().next())
-        .unwrap();
-    let other_core = core_affinity::get_core_ids()
-        .and_then(|cores| cores.into_iter().nth(1))
-        .unwrap();
+    let cores = get_cached_core_ids();
+    let target_core = cores.first().copied().unwrap();
+    let other_core = cores.get(1).copied().unwrap();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -271,10 +266,12 @@ pub fn benchmark_tokio_single(spec: PriorityBenchmarkSpec) -> BenchmarkResult {
         local
             .run_until(async {
                 // Spawn background tasks (no priority distinction - same as foreground)
+                let rng = StdRng::seed_from_u64(0xC0FFEE);
                 for _ in 0..spec.background_count {
                     let shutdown = shutdown.clone();
+                    let mut rng = rng.clone();
                     tokio::task::spawn_local(async move {
-                        background_loop(shutdown).await;
+                        background_loop(shutdown, &mut rng).await;
                     });
                 }
 
@@ -283,11 +280,8 @@ pub fn benchmark_tokio_single(spec: PriorityBenchmarkSpec) -> BenchmarkResult {
                 while let Ok(task) = rx.recv_async().await {
                     let handle = tokio::task::spawn_local(async move {
                         let start_time = Instant::now();
-                        let cpu_start = Instant::now();
                         let queue_delay = start_time.duration_since(task.submit_time);
                         task.work.run().await;
-                        let cpu_time = cpu_start.elapsed().as_nanos();
-                        FOREGROUND_CPU_TIME_NS.fetch_add(cpu_time as u64, Ordering::Relaxed);
                         let total_latency = task.submit_time.elapsed();
                         (queue_delay, total_latency)
                     });
@@ -332,9 +326,8 @@ pub fn benchmark_two_runtime(spec: PriorityBenchmarkSpec) -> BenchmarkResult {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Determine target core (use core 0, or first available)
-    let target_core = core_affinity::get_core_ids()
-        .and_then(|cores| cores.into_iter().next())
-        .expect("No CPU cores available");
+    let cores = get_cached_core_ids();
+    let target_core = cores.first().copied().expect("No CPU cores available");
 
     // Spawn background runtime thread (low priority)
     let bg_shutdown = shutdown.clone();
@@ -359,10 +352,12 @@ pub fn benchmark_two_runtime(spec: PriorityBenchmarkSpec) -> BenchmarkResult {
             local
                 .run_until(async {
                     // Spawn background tasks
+                    let rng = StdRng::seed_from_u64(0xC0FFEE);
                     for _ in 0..bg_count {
                         let shutdown = bg_shutdown.clone();
+                        let mut rng = rng.clone();
                         tokio::task::spawn_local(async move {
-                            background_loop(shutdown).await;
+                            background_loop(shutdown, &mut rng).await;
                         });
                     }
 
@@ -403,10 +398,7 @@ pub fn benchmark_two_runtime(spec: PriorityBenchmarkSpec) -> BenchmarkResult {
                         let handle = tokio::task::spawn_local(async move {
                             let start_time = Instant::now();
                             let queue_delay = start_time.duration_since(task.submit_time);
-                            let cpu_start = Instant::now();
                             task.work.run().await;
-                            let cpu_time = cpu_start.elapsed().as_nanos();
-                            FOREGROUND_CPU_TIME_NS.fetch_add(cpu_time as u64, Ordering::Relaxed);
                             let total_latency = task.submit_time.elapsed();
                             let _ = result_tx.send((queue_delay, total_latency));
                         });
@@ -425,8 +417,9 @@ pub fn benchmark_two_runtime(spec: PriorityBenchmarkSpec) -> BenchmarkResult {
     });
 
     // Spawn generator on a DIFFERENT core to avoid interference
-    let other_core = core_affinity::get_core_ids()
-        .and_then(|cores| cores.into_iter().nth(1))
+    let other_core = get_cached_core_ids()
+        .get(1)
+        .copied()
         .unwrap_or(target_core); // Fall back if only one core
 
     let gen_handle = {
@@ -531,82 +524,7 @@ impl BenchmarkResult {
             "  max:  {:>10.2?}",
             self.metrics.quantile(100.0, "total_latency")
         );
-        let bg_cpu = Duration::from_nanos(BACKGROUND_CPU_TIME_NS.load(Ordering::SeqCst));
-        let fg_cpu = Duration::from_nanos(FOREGROUND_CPU_TIME_NS.load(Ordering::SeqCst));
-        println!(
-            "Actual CPU time - BG: {:.2?}, FG: {:.2?}, Total: {:.2?}",
-            bg_cpu,
-            fg_cpu,
-            bg_cpu + fg_cpu
-        );
-        println!(
-            "CPU utilization: {:.1}%",
-            (bg_cpu + fg_cpu).as_secs_f64() / self.elapsed.as_secs_f64() * 100.0
-        );
     }
-}
-
-/// Diagnostic: verify threads are actually on the same core
-fn verify_single_core() {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Barrier;
-
-    let barrier = Arc::new(Barrier::new(2));
-    let counter1 = Arc::new(AtomicU64::new(0));
-    let counter2 = Arc::new(AtomicU64::new(0));
-
-    let target_core = core_affinity::get_core_ids()
-        .and_then(|cores| cores.into_iter().next())
-        .unwrap();
-
-    let c1 = counter1.clone();
-    let b1 = barrier.clone();
-    let t1 = thread::spawn(move || {
-        core_affinity::set_for_current(target_core);
-        b1.wait(); // Sync start
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(1) {
-            c1.fetch_add(1, Ordering::Relaxed);
-        }
-    });
-
-    let c2 = counter2.clone();
-    let b2 = barrier.clone();
-    let t2 = thread::spawn(move || {
-        core_affinity::set_for_current(target_core);
-        b2.wait(); // Sync start
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(1) {
-            c2.fetch_add(1, Ordering::Relaxed);
-        }
-    });
-
-    t1.join().unwrap();
-    t2.join().unwrap();
-
-    // Also measure single-thread baseline
-    let counter_solo = AtomicU64::new(0);
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(1) {
-        counter_solo.fetch_add(1, Ordering::Relaxed);
-    }
-
-    let solo = counter_solo.load(Ordering::Relaxed);
-    let combined = counter1.load(Ordering::Relaxed) + counter2.load(Ordering::Relaxed);
-
-    println!("Core affinity diagnostic:");
-    println!("  Single thread: {} iterations", solo);
-    println!("  Two threads combined: {} iterations", combined);
-    println!("  Ratio: {:.2}x", combined as f64 / solo as f64);
-    println!();
-
-    if combined as f64 / solo as f64 > 1.5 {
-        println!("  WARNING: Threads appear to be on different cores!");
-        println!("  macOS may be ignoring core_affinity hints.");
-    } else {
-        println!("  OK: Threads appear to be sharing a core.");
-    }
-    println!();
 }
 
 // ============================================================================
@@ -614,7 +532,6 @@ fn verify_single_core() {
 // ============================================================================
 
 fn main() {
-    verify_single_core();
     let spec = PriorityBenchmarkSpec::default();
 
     println!("Priority Benchmark");
@@ -629,12 +546,22 @@ fn main() {
 
     // Run benchmarks
     println!("\nRunning Clockworker benchmark...");
-    let cw_result = benchmark_clockworker(PriorityBenchmarkSpec::default());
-    cw_result.print_summary("Clockworker");
+    let spec = PriorityBenchmarkSpec::default();
+    let cw_result = benchmark_clockworker(spec);
+    cw_result.print_summary("Clockworker (both foreground + background)");
+
+    let mut spec = PriorityBenchmarkSpec::default();
+    spec.background_count = 0;
+    let cw_result_fg_only = benchmark_clockworker(spec);
+    cw_result_fg_only.print_summary("Clockworker (foreground only)");
 
     println!("\nRunning Tokio single-threaded benchmark...");
     let tokio_result = benchmark_tokio_single(PriorityBenchmarkSpec::default());
     tokio_result.print_summary("Tokio Single-Threaded");
+    let mut spec = PriorityBenchmarkSpec::default();
+    spec.background_count = 0;
+    let tokio_result_fg_only = benchmark_tokio_single(spec);
+    tokio_result_fg_only.print_summary("Tokio Single-Threaded (foreground only)");
 
     println!("\nRunning Two-Runtime (OS priority) benchmark...");
     let two_rt_result = benchmark_two_runtime(PriorityBenchmarkSpec::default());
@@ -645,31 +572,45 @@ fn main() {
     println!("=== COMPARISON TABLE ===");
     println!();
     print_comparison_table(&[
-        ("Clockworker", &cw_result),
-        ("Tokio Single", &tokio_result),
-        ("Two-RT/OS", &two_rt_result),
+        ("Clockworker (fg + bg)", &cw_result),
+        ("Clockworker (fg only)", &cw_result_fg_only),
+        ("Tokio (fg + bg)", &tokio_result),
+        ("Tokio (fg only)", &tokio_result_fg_only),
+        ("Tokio Two-RT/OS", &two_rt_result),
     ]);
 }
 
 fn print_comparison_table(results: &[(&str, &BenchmarkResult)]) {
-    println!(
-        "{:<15} {:>10} {:>10} {:>10} {:>10} {:>12}",
-        "Config", "p50", "p99", "p999", "max", "BG iter/s"
-    );
-    println!(
-        "{:-<15} {:-<10} {:-<10} {:-<10} {:-<10} {:-<12}",
-        "", "", "", "", "", ""
-    );
-
-    for (name, result) in results {
-        println!(
-            "{:<15} {:>10.2?} {:>10.2?} {:>10.2?} {:>10.2?} {:>12.0}",
-            name,
-            result.metrics.quantile(50.0, "total_latency"),
-            result.metrics.quantile(99.0, "total_latency"),
-            result.metrics.quantile(99.9, "total_latency"),
-            result.metrics.quantile(100.0, "total_latency"),
-            result.background_throughput(),
-        );
+    #[derive(tabled::Tabled)]
+    struct ComparisonTable {
+        name: String,
+        p50_queue_delay: String,
+        p90_queue_delay: String,
+        p99_queue_delay: String,
+        p50_total_latency: String,
+        p90_total_latency: String,
+        p99_total_latency: String,
+        bg_iter_s: String,
     }
+    let mut rows = Vec::new();
+    for (name, result) in results {
+        rows.push(ComparisonTable {
+            name: name.to_string(),
+            p50_queue_delay: print_quantile(&result.metrics, "queue_delay", 50.0),
+            p90_queue_delay: print_quantile(&result.metrics, "queue_delay", 90.0),
+            p99_queue_delay: print_quantile(&result.metrics, "queue_delay", 99.0),
+            p50_total_latency: print_quantile(&result.metrics, "total_latency", 50.0),
+            p90_total_latency: print_quantile(&result.metrics, "total_latency", 90.0),
+            p99_total_latency: print_quantile(&result.metrics, "total_latency", 99.0),
+            bg_iter_s: format!("{:.0}", result.background_throughput()),
+        });
+    }
+    let table = Table::builder(rows).index().column(0).transpose().build();
+    println!("{}", table);
+}
+
+fn print_quantile(metrics: &Metrics, tag: &str, quantile: f64) -> String {
+    let micros = metrics.quantile(quantile, tag).as_micros();
+    // print two decimal places
+    format!("{:.2}ms", micros as f64 / 1000.0)
 }
