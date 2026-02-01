@@ -350,12 +350,17 @@ impl<K: QueueKey> Executor<K> {
         let mut tasks = self.tasks.borrow_mut();
         let entry = tasks.vacant_entry();
         let id = entry.key();
+        let preempt_state = if self.queue_mpscs.len() > 1 {
+            Some(self.preempt_state.clone())
+        } else {
+            None
+        };
         let header = Arc::new(TaskHeader::new(
             id,
             qid,
             qidx,
             self.queue_mpscs[qidx].clone(),
-            self.preempt_state.clone(),
+            preempt_state,
         ));
         let join = Arc::new(JoinState::<T>::new());
         // Wrap user future to publish result into JoinState.
@@ -473,6 +478,9 @@ impl<K: QueueKey> Executor<K> {
     /// We track total CPU time in nanoseconds and compute vruntime on-the-fly
     /// when selecting (total_cpu_nanos / weight), avoiding rounding issues.
     fn charge_class(&self, qidx: usize, elapsed: Duration) {
+        if self.queue_mpscs.len() <= 1 {
+            return;
+        }
         let mut queues = self.queues.borrow_mut();
         let queue = &mut queues[qidx];
         // ceil of (elapsed / share)
@@ -481,6 +489,9 @@ impl<K: QueueKey> Executor<K> {
         queue.stats.record_poll(elapsed);
     }
     fn update_min_vruntime(&self, including: u128) {
+        if self.queue_mpscs.len() <= 1 {
+            return;
+        }
         let min_vruntime = self
             .queues
             .borrow()
@@ -643,6 +654,13 @@ impl<K: QueueKey> Executor<K> {
         } else {
             None
         };
+        // if there is only one queue, bypass all machinery
+        if self.queue_mpscs.len() == 1 {
+            match self.queue_mpscs[0].is_empty() {
+                true => return None,
+                false => return Some((0, self.options.sched_latency)),
+            }
+        }
 
         let Some((selected_idx, timeslice, selected_deadline, num_runnable)) =
             self.pick_next_class()

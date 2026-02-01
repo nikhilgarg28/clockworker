@@ -26,7 +26,7 @@ pub struct TaskHeader<K: QueueKey> {
     ingress_tx: Arc<Mpsc<TaskId>>,
     /// Shared preemption state - used to signal when this task's queue
     /// would preempt the currently running queue
-    preempt_state: Arc<PreemptState>,
+    preempt_state: Option<Arc<PreemptState>>,
 }
 
 impl<K: QueueKey> TaskHeader<K> {
@@ -35,7 +35,7 @@ impl<K: QueueKey> TaskHeader<K> {
         qid: K,
         qidx: usize,
         ingress_tx: Arc<Mpsc<TaskId>>,
-        preempt_state: Arc<PreemptState>,
+        preempt_state: Option<Arc<PreemptState>>,
     ) -> Self {
         Self {
             id,
@@ -63,8 +63,10 @@ impl<K: QueueKey> TaskHeader<K> {
             let _ = self.ingress_tx.enqueue(self.id);
 
             // Check if this queue would preempt the currently running queue
-            if self.preempt_state.would_preempt(self.qidx) {
-                self.preempt_state.request_preempt();
+            if let Some(preempt_state) = &self.preempt_state {
+                if preempt_state.would_preempt(self.qidx) {
+                    preempt_state.request_preempt();
+                }
             }
         }
     }
