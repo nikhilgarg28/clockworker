@@ -5,7 +5,7 @@
 <!-- 5) Base it on new linux scheduler - deadline, min vruntime, sched_latency, 
    <!-- min_slice, and driver_yield --> -->
 <!-- 6) Build basic stats -->
-7) Allow queue to configure panic behavior
+<!-- 7) Allow queue to configure panic behavior -->
 8) Allow queue to configure some debug on futures taking "too long"
 <!-- 9) Allow spawned tasks to inherit parent's properties? -->
 10) Enable LIFO optimization in some cases?
@@ -18,5 +18,7 @@
 <!-- 16) dont' make spawn return error - if not accepting, make tasks canceled -->
 17) Option to enable stats
 <!-- 18) Configuration builder (e.g. sched_latency etc.) -->
-Remove mpsc2, hide frspt, remove all prints
-Add method for with_queue and with_queue_having_scheduler
+Remove mpsc2
+<!-- Add method for with_queue and with_queue_having_scheduler -->
+Change tcp benchmark to not have handle.await and instead do shutdown signal
+Add fast path where there is only one queue - bypass vruntime etc.

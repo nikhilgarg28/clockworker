@@ -1,4 +1,5 @@
 use crate::mpsc::Mpsc;
+use crate::preempt::PreemptState;
 use crate::queue::{QueueKey, TaskId};
 use futures::task::ArcWake;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,6 +10,8 @@ use std::sync::Arc;
 pub struct TaskHeader<K: QueueKey> {
     id: TaskId,
     qid: K,
+    /// Index of the queue this task belongs to (0-255)
+    qidx: usize,
     // changes to true when task is enqueued
     // if this flag is true, it's not enqueued again
     queued: AtomicBool,
@@ -21,17 +24,28 @@ pub struct TaskHeader<K: QueueKey> {
     // this is the ground truth for cancellation, not join state
     cancelled: AtomicBool,
     ingress_tx: Arc<Mpsc<TaskId>>,
+    /// Shared preemption state - used to signal when this task's queue
+    /// would preempt the currently running queue
+    preempt_state: Arc<PreemptState>,
 }
 
 impl<K: QueueKey> TaskHeader<K> {
-    pub fn new(id: TaskId, qid: K, ingress_tx: Arc<Mpsc<TaskId>>) -> Self {
+    pub fn new(
+        id: TaskId,
+        qid: K,
+        qidx: usize,
+        ingress_tx: Arc<Mpsc<TaskId>>,
+        preempt_state: Arc<PreemptState>,
+    ) -> Self {
         Self {
             id,
             qid,
+            qidx,
             queued: AtomicBool::new(false),
             done: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             ingress_tx,
+            preempt_state,
         }
     }
     pub fn qid(&self) -> K {
@@ -47,6 +61,11 @@ impl<K: QueueKey> TaskHeader<K> {
             // Unbounded send should not block.
             // If receiver is dropped, ignore.
             let _ = self.ingress_tx.enqueue(self.id);
+
+            // Check if this queue would preempt the currently running queue
+            if self.preempt_state.would_preempt(self.qidx) {
+                self.preempt_state.request_preempt();
+            }
         }
     }
     pub fn cancel(&self) {

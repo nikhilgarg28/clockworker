@@ -1,6 +1,7 @@
 use crate::{
     join::{JoinHandle, JoinState},
     mpsc::Mpsc,
+    preempt::PreemptState,
     queue::{Queue, QueueKey, TaskId},
     stats::{ExecutorStats, QueueStats},
     task::TaskHeader,
@@ -24,6 +25,7 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
+
 thread_local! {
     static YIELD_MAYBE_DEADLINE: Cell<Option<Instant>> = Cell::new(None);
 }
@@ -260,6 +262,10 @@ pub struct Executor<K: QueueKey> {
 
     min_vruntime: std::cell::Cell<u128>,
 
+    /// Shared preemption state - allows wakers to signal when a higher-priority
+    /// queue has tasks, enabling early timeslice termination.
+    preempt_state: Arc<PreemptState>,
+
     // stats
     stats: RefCell<ExecutorStats>,
 }
@@ -287,6 +293,13 @@ impl<K: QueueKey> Executor<K> {
 
         // Create one mpsc channel per queue
         let num_queues = queues.len();
+        if num_queues > 256 {
+            return Err("Cannot have more than 256 queues (preemption mask limit)".to_string());
+        }
+
+        // Create shared preemption state
+        let preempt_state = Arc::new(PreemptState::new());
+
         let queue_mpscs: Vec<Arc<Mpsc<TaskId>>> =
             (0..num_queues).map(|_| Arc::new(Mpsc::new())).collect();
 
@@ -305,6 +318,7 @@ impl<K: QueueKey> Executor<K> {
             qids: RefCell::new(qids),
             options,
             min_vruntime: std::cell::Cell::new(0),
+            preempt_state,
             stats: RefCell::new(ExecutorStats::new(Instant::now())),
         }))
     }
@@ -336,7 +350,13 @@ impl<K: QueueKey> Executor<K> {
         let mut tasks = self.tasks.borrow_mut();
         let entry = tasks.vacant_entry();
         let id = entry.key();
-        let header = Arc::new(TaskHeader::new(id, qid, self.queue_mpscs[qidx].clone()));
+        let header = Arc::new(TaskHeader::new(
+            id,
+            qid,
+            qidx,
+            self.queue_mpscs[qidx].clone(),
+            self.preempt_state.clone(),
+        ));
         let join = Arc::new(JoinState::<T>::new());
         // Wrap user future to publish result into JoinState.
         // catch_panics = !panic_on_task_panic (if executor panics on task panic, we don't catch)
@@ -359,9 +379,11 @@ impl<K: QueueKey> Executor<K> {
 
     /// Pick the next runnable class by deadline among classes that have
     /// runnable tasks. Deadline is vruntime + sched_latency / num_runnable,
-    /// so higher weight classes
-    /// have lower deadline for the same CPU time, making them preferred.
-    fn pick_next_class(&self) -> Option<(usize, Duration)> {
+    /// so higher weight classes have lower deadline for the same CPU time,
+    /// making them preferred.
+    ///
+    /// Returns (selected_idx, timeslice, selected_deadline, num_runnable) or None if no queues are runnable.
+    fn pick_next_class(&self) -> Option<(usize, Duration, u128, usize)> {
         let mut best: Option<(usize, u128)> = None;
         let mut runnable = None;
         let mut num_runnable = 0;
@@ -385,8 +407,19 @@ impl<K: QueueKey> Executor<K> {
         let request = request.max(self.options.min_slice.as_nanos() as u128);
 
         if num_runnable == 1 {
-            return Some((runnable.unwrap(), Duration::from_nanos(request as u64)));
+            let selected_idx = runnable.unwrap();
+            let queues = self.queues.borrow();
+            let selected_deadline =
+                queues[selected_idx].vruntime + (request / queues[selected_idx].share as u128);
+            return Some((
+                selected_idx,
+                Duration::from_nanos(request as u64),
+                selected_deadline,
+                num_runnable,
+            ));
         }
+
+        // Multiple runnable queues - find the best one
         for (idx, q) in self.queues.borrow().iter().enumerate() {
             if q.mpsc.is_empty() {
                 continue;
@@ -399,7 +432,41 @@ impl<K: QueueKey> Executor<K> {
                 _ => {}
             }
         }
-        best.map(|(i, _)| (i, Duration::from_nanos(request as u64)))
+
+        let (selected_idx, selected_deadline) = best.unwrap();
+        Some((
+            selected_idx,
+            Duration::from_nanos(request as u64),
+            selected_deadline,
+            num_runnable,
+        ))
+    }
+
+    /// Compute and update the preemption mask based on the selected queue.
+    /// Empty queues that would have higher priority than the selected queue
+    /// are marked in the mask so their wakers can trigger preemption.
+    fn update_preempt_mask(&self, selected_deadline: u128, num_runnable: usize) {
+        let is_runnable = self.is_runnable.borrow();
+        let queues = self.queues.borrow();
+
+        // Calculate hypothetical request if one more queue becomes runnable
+        let hypothetical_request =
+            self.options.sched_latency.as_nanos() as u128 / (num_runnable + 1) as u128;
+        let hypothetical_request =
+            hypothetical_request.max(self.options.min_slice.as_nanos() as u128);
+        let min_vruntime = self.min_vruntime.get();
+
+        // Find empty queues that would preempt if they got a task
+        let preempting = (0..queues.len()).filter(|&idx| {
+            if is_runnable[idx] {
+                return false; // Already runnable, skip
+            }
+            // Hypothetical deadline: inherits min_vruntime
+            let hypothetical_deadline =
+                min_vruntime + (hypothetical_request / queues[idx].share as u128);
+            hypothetical_deadline < selected_deadline
+        });
+        self.preempt_state.update_mask(preempting);
     }
 
     /// Charge elapsed CPU time to a class.
@@ -444,11 +511,13 @@ impl<K: QueueKey> Executor<K> {
 
     /// Run the executor loop until the given future completes.
     ///
-    /// Panic behavior: if any task panics while being polled, the executor panics (propagates).
+    /// Panic behavior: if any task panics while being polled, the executor
+    /// panics (propagates) unless executor has been configured to catch panics
+    /// with `with_panic_on_task_panic(false)`.
     ///
-    /// The executor will continue running tasks until `until` completes, then returns.
-    /// When the executor stops, pending tasks remain pending and will resume if `run_until`
-    /// is called again (Tokio-like behavior).
+    /// The executor will continue running tasks until `until` completes, then
+    /// returns. When the executor stops, pending tasks remain pending and will
+    /// resume if `run_until` is called again (Tokio-like behavior).
     pub async fn run_until<F: Future>(&self, until: F) -> F::Output {
         let mut until_pinned = std::pin::pin!(until.fuse());
 
@@ -567,18 +636,34 @@ impl<K: QueueKey> Executor<K> {
     }
 
     /// Select the next queue to run and measure the decision time.
+    /// Clears the preempt flag when a new timeslice is selected.
     fn select_queue(&self, enable_stats: bool) -> Option<(usize, Duration)> {
         let start = if enable_stats {
             Some(Instant::now())
         } else {
             None
         };
-        let result = self.pick_next_class();
+
+        let Some((selected_idx, timeslice, selected_deadline, num_runnable)) =
+            self.pick_next_class()
+        else {
+            // No runnable queues, clear preempt mask
+            self.preempt_state.update_mask(std::iter::empty());
+            return None;
+        };
+
+        // Clear preempt flag when starting a new timeslice
+        self.preempt_state.clear_preempt();
+
+        // Compute which empty queues would preempt the selected queue
+        self.update_preempt_mask(selected_deadline, num_runnable);
+
         if let Some(start) = start {
             let elapsed = Instant::now().duration_since(start);
             self.stats.borrow_mut().record_schedule_decision(elapsed);
         }
-        result
+
+        Some((selected_idx, timeslice))
     }
 
     /// Pop the next valid task from a queue, skipping stale/done tasks.
@@ -684,7 +769,8 @@ impl<K: QueueKey> Executor<K> {
         tasks.remove(id);
     }
 
-    /// Execute tasks from a selected queue until the timeslice is exhausted.
+    /// Execute tasks from a selected queue until the timeslice is exhausted,
+    /// preemption is requested, or max polls is reached.
     fn run_timeslice(&self, qidx: usize, timeslice: Duration, enable_stats: bool) -> Instant {
         let now = Instant::now();
         let until = now + timeslice;
@@ -726,6 +812,10 @@ impl<K: QueueKey> Executor<K> {
                     queues[qidx].stats.record_slice_overrun();
                     queues[qidx].stats.record_slice_exhausted();
                 }
+                break;
+            }
+            // Check for preemption - a higher priority queue has tasks
+            if self.preempt_state.check() {
                 break;
             }
         }
@@ -1350,6 +1440,68 @@ mod tests {
                     0,
                     "Task should be removed after panic"
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_preemption_mask_computed_correctly() {
+        // Test that select_queue computes the preempt mask correctly
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                // Create executor with queues of different weights
+                // Queue 0: weight 8 (highest priority when empty has lowest vruntime)
+                // Queue 1: weight 4
+                // Queue 2: weight 1 (lowest priority)
+                let executor = ExecutorBuilder::new()
+                    .with_queue(0, 8)
+                    .with_queue(1, 4)
+                    .with_queue(2, 1)
+                    .build()
+                    .unwrap();
+
+                let queue2 = executor.queue(2).unwrap();
+                let preempt_state = executor.preempt_state.clone();
+
+                executor
+                    .run_until(async {
+                        // Spawn a task only on queue 2 (lowest priority)
+                        let handle = queue2.spawn(async {
+                            loop {
+                                yield_once().await;
+                            }
+                        });
+
+                        // Use sleep to allow the executor to run select_queue() and compute the mask.
+                        // Sleep gives the tokio driver a chance to run, and when it returns,
+                        // the executor will have already run at least one iteration calling select_queue().
+                        sleep(Duration::from_millis(10)).await;
+
+                        // At this point, queue 2 should be selected (only runnable)
+                        // and queues 0 and 1 should be in the preempt mask since they
+                        // would have higher priority if they got tasks
+                        assert!(
+                            preempt_state.would_preempt(0),
+                            "Queue 0 (weight 8) should preempt queue 2 (weight 1)"
+                        );
+                        assert!(
+                            preempt_state.would_preempt(1),
+                            "Queue 1 (weight 4) should preempt queue 2 (weight 1)"
+                        );
+                        assert!(
+                            !preempt_state.would_preempt(2),
+                            "Queue 2 is runnable, should not be in preempt mask"
+                        );
+                        assert!(
+                            !preempt_state.check(),
+                            "Preempt flag should not be set (no higher priority task enqueued)"
+                        );
+
+                        handle.abort();
+                        let _ = handle.await;
+                    })
+                    .await;
             })
             .await;
     }
