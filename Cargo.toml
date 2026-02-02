@@ -1,6 +1,6 @@
 [package]
 name = "clockworker"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "A single-threaded async executor with EEVDF-based fair scheduling and pluggable task schedulers"
 license = "Apache-2.0"
@@ -50,6 +50,10 @@ harness = false
 
 [[bench]]
 name = "tcp"
+harness = false
+
+[[bench]]
+name = "pingpong"
 harness = false
 
 [profile.samply]

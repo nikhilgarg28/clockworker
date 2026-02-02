@@ -4,6 +4,21 @@ Clockworker, loosely inspired by Seastar, is a single-threaded async executor
 with fair scheduling across multiple queues. Clockworker is agnostic to the underlying
 async runtime and can sit on top of any runtime like Tokio, Monoio, or Smol.
 
+┌─────────────────────────────────────────┐
+│            Your Application             │
+├─────────────────────────────────────────┤
+│   Clockworker (async executor/scheduler)│
+│   - Priority queues                     |
+│   - Timeslice management                │
+|   - Priority based preemption           |
+├─────────────────────────────────────────┤
+│   Any async IO Driver                   │
+│   ┌─────────┐ ┌─────────┐ ┌─────────┐   │
+│   │  tokio  │ │ monoio  │ │ glommio │   │
+│   │ (epoll) │ │(io_uring)│ │(io_uring)│ │
+│   └─────────┘ └─────────┘ └─────────┘   │
+└─────────────────────────────────────────┘
+
 **⚠️ Early/Alpha Release**: This project is in early development. APIs may change in breaking ways between versions. Use at your own risk.
 
 ## What is Clockworker for?
@@ -22,6 +37,65 @@ executes tasks from that queue in FIFO order.
 
 Note that Clockworker itself is just an executor loop, not a full async runtime, and
 is designed to sit on top of any other runtime.
+
+## Benchmarks
+
+**Setup**
+
+Foreground tasks are generated at RPS of 1K/sec, each doing 1-3 yields - at each
+yield point, the task does variable (100-500us) of cpu work and a variable (100-500us)
+of sleep. In addition, some background tasks (0 or 8) are also generated that do 
+similar amount of cpu work and sleep. Background tasks, when present, have enough
+CPU work in aggregate to saturate the CPU.
+
+The workload runs on a single thread pinned to a core while the work generation
+happens on another thread/core. Two latencies are measured: a) time from task
+generation to task starting (i.e. queue delay) b) end to end time from task 
+generation to task finishing (i.e. total latency). In addition, the amount of
+background work done is also measured.
+
+
+The benchmark compares five options:
+1. Tokio single threaded runtime with only foreground tasks (baseline)
+2. Tokio single threaded runtime with both foreground & background tasks
+3. Clockworker executor on top of tokio single threaded runtime with only foreground tasks
+4. Same as #3 above but with both foreground/background tasks.
+5. Two separate single threaded tokio runtimes - one for background and one for
+foreground (no coordination between them)
+
+**Results**
+|       Metric       |    Tokio (fg only)     |       CW (fg+bg)       |      CW (fg only)      |     Tokio (fg+bg)      |       Two-RT/OS        |
+|--------------------|------------------------|------------------------|------------------------|------------------------|------------------------|
+|  p50 queue delay   |         0.40ms         |      0.41ms (+2%)      |      0.38ms (-5%)      |    8.33ms (+1982%)     |     0.49ms (+22%)      |
+|  p90 queue delay   |         1.23ms         |      1.18ms (-4%)      |      1.20ms (-2%)      |    12.05ms (+880%)     |     1.39ms (+13%)      |
+|  p99 queue delay   |         2.19ms         |      2.18ms (-0%)      |      2.18ms (-0%)      |    15.89ms (+626%)     |     2.52ms (+15%)      |
+| p50 total latency  |         2.44ms         |      2.37ms (-3%)      |      2.46ms (+1%)      |    14.78ms (+506%)     |      2.56ms (+5%)      |
+| p90 total latency  |         4.65ms         |      4.53ms (-3%)      |      4.71ms (+1%)      |    24.23ms (+421%)     |      4.83ms (+4%)      |
+| p99 total latency  |         6.16ms         |      6.11ms (-1%)      |      6.30ms (+2%)      |    31.60ms (+413%)     |      6.63ms (+8%)      |
+|   BG throughput    |           0            |          1299          |           0            |          1337          |          1299          |
+
+**Interpretation**
+1. Clockworker adds negligible overhead and with foreground only tasks, is competitive
+   with singel threaded tokio runtime.
+2. With Tokio runtime, foreground latency degrades 4-5x with background tasks.
+3. With Clockworker executor, background tasks don't impact the foreground latency 
+   at all - and the performance is competitive with tokio foreground only
+4. Adding two-runtimes is also competitive from latency POV
+5. All three options with background tasks are comparable in terms of the volume
+   of the background work done.
+
+## Clockworker vs Multiple Runtimes
+
+While running multiple runtimes, one for each priority queue, is competitive
+with Clockworker as shown in above benchmarks, there are a few other benefits
+of using clockworker:
+1. Less complexity - it's some additional work to setup & maintain multiple runtimes
+   (e.g. graceful shutdowns, sharing stats etc.)
+2. Clockworkes works with !Send and !Sync futures - no need for Arc/Mutex etc. This both
+   improves ergonomics and may also show up as overhead depending on the application 
+   (not tested in the benchmarks)
+3. It's non-trivial to setup multiple runtimes in platform agnostic way (e.g. CPU
+    affinity works differently on Mac vs Linux)
 
 ## Features
 
@@ -249,64 +323,6 @@ This design allows you to:
 - Allocate CPU resources between different workload classes (via queue weights)
 - Ensure predictable task ordering within each queue
 
-## Benchmarks
-
-**Setup**
-
-Foreground tasks are generated at RPS of 1K/sec, each doing 1-3 yields - at each
-yield point, the task does variable (100-500us) of cpu work and a variable (100-500us)
-of sleep. In addition, some background tasks (0 or 8) are also generated that do 
-similar amount of cpu work and sleep. Background tasks, when present, have enough
-CPU work in aggregate to saturate the CPU.
-
-The workload runs on a single thread pinned to a core while the work generation
-happens on another thread/core. Two latencies are measured: a) time from task
-generation to task starting (i.e. queue delay) b) end to end time from task 
-generation to task finishing (i.e. total latency). In addition, the amount of
-background work done is also measured.
-
-
-The benchmark compares five options:
-1. Tokio single threaded runtime with only foreground tasks (baseline)
-2. Tokio single threaded runtime with both foreground & background tasks
-3. Clockworker executor on top of tokio single threaded runtime with only foreground tasks
-4. Same as #3 above but with both foreground/background tasks.
-5. Two separate single threaded tokio runtimes - one for background and one for
-foreground (no coordination between them)
-
-**Results**
-|       Metric       |    Tokio (fg only)     |       CW (fg+bg)       |      CW (fg only)      |     Tokio (fg+bg)      |       Two-RT/OS        |
-|--------------------|------------------------|------------------------|------------------------|------------------------|------------------------|
-|  p50 queue delay   |         0.40ms         |      0.41ms (+2%)      |      0.38ms (-5%)      |    8.33ms (+1982%)     |     0.49ms (+22%)      |
-|  p90 queue delay   |         1.23ms         |      1.18ms (-4%)      |      1.20ms (-2%)      |    12.05ms (+880%)     |     1.39ms (+13%)      |
-|  p99 queue delay   |         2.19ms         |      2.18ms (-0%)      |      2.18ms (-0%)      |    15.89ms (+626%)     |     2.52ms (+15%)      |
-| p50 total latency  |         2.44ms         |      2.37ms (-3%)      |      2.46ms (+1%)      |    14.78ms (+506%)     |      2.56ms (+5%)      |
-| p90 total latency  |         4.65ms         |      4.53ms (-3%)      |      4.71ms (+1%)      |    24.23ms (+421%)     |      4.83ms (+4%)      |
-| p99 total latency  |         6.16ms         |      6.11ms (-1%)      |      6.30ms (+2%)      |    31.60ms (+413%)     |      6.63ms (+8%)      |
-|   BG throughput    |           0            |          1299          |           0            |          1337          |          1299          |
-
-**Interpretation**
-1. Clockworker adds negligible overhead and with foreground only tasks, is competitive
-   with singel threaded tokio runtime.
-2. With Tokio runtime, foreground latency degrades 4-5x with background tasks.
-3. With Clockworker executor, background tasks don't impact the foreground latency 
-   at all - and the performance is competitive with tokio foreground only
-4. Adding two-runtimes is also competitive from latency POV
-5. All three options with background tasks are comparable in terms of the volume
-   of the background work done.
-
-## Clockworker vs Multiple Runtimes
-
-While running multiple runtimes, one for each priority queue, is competitive
-with Clockworker as shown in above benchmarks, there are a few other benefits
-of using clockworker:
-1. Less complexity - it's some additional work to setup & maintain multiple runtimes
-   (e.g. graceful shutdowns, sharing stats etc.)
-2. Clockworkes works with !Send and !Sync futures - no need for Arc/Mutex etc. This both
-   improves ergonomics and may also show up as overhead depending on the application 
-   (not tested in the benchmarks)
-3. It's non-trivial to setup multiple runtimes in platform agnostic way (e.g. CPU
-    affinity works differently on Mac vs Linux)
 
 ## Requirements
 

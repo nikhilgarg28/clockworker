@@ -1,8 +1,7 @@
 use crate::{
     join::{JoinHandle, JoinState},
-    mpsc::Mpsc,
     preempt::PreemptState,
-    queue::{Queue, QueueKey, TaskId},
+    queue::{Queue, QueueKey, TaskId, TaskQueue},
     stats::{ExecutorStats, QueueStats},
     task::TaskHeader,
     yield_once::yield_once,
@@ -131,17 +130,17 @@ struct TaskRecord<K: QueueKey> {
 struct QueueState<K: QueueKey> {
     vruntime: u128, // total CPU time consumed (in nanoseconds)
     share: u64,
-    mpsc: Arc<Mpsc<TaskId>>,
+    task_queue: Arc<TaskQueue>,
     stats: QueueStats<K>,
 }
 
 impl<K: QueueKey> QueueState<K> {
-    fn new(queue: Queue<K>, mpsc: Arc<Mpsc<TaskId>>) -> Self {
+    fn new(queue: Queue<K>, task_queue: Arc<TaskQueue>) -> Self {
         Self {
             vruntime: 0,
             stats: QueueStats::new(queue.id(), queue.share()),
             share: queue.share(),
-            mpsc,
+            task_queue,
         }
     }
 }
@@ -201,6 +200,21 @@ impl<K: QueueKey> ExecutorBuilder<K> {
         self.options.max_polls_per_yield = max_polls;
         self
     }
+    /// Enable or disable LIFO slot optimization.
+    /// When enabled, the most recently enqueued task is prioritized for cache locality.
+    /// Default is true.
+    pub fn with_enable_lifo(mut self, enable: bool) -> Self {
+        self.options.enable_lifo = enable;
+        self
+    }
+    /// Set the LIFO skip interval.
+    /// Every N pops, the LIFO slot is skipped to maintain fairness.
+    /// Only used when LIFO is enabled.
+    /// Default is 16.
+    pub fn with_lifo_skip_interval(mut self, interval: usize) -> Self {
+        self.options.lifo_skip_interval = interval;
+        self
+    }
     pub fn build(self) -> Result<Rc<Executor<K>>, String> {
         Executor::new(self.options, self.queues)
     }
@@ -214,6 +228,10 @@ pub struct ExecutorOptions {
     /// Maximum number of task polls before yielding to the driver.
     /// This ensures I/O-heavy workloads don't starve the reactor.
     max_polls_per_yield: u32,
+    /// Enable LIFO slot optimization for cache locality.
+    enable_lifo: bool,
+    /// Skip LIFO slot every N pops to maintain fairness.
+    lifo_skip_interval: usize,
 }
 impl Default for ExecutorOptions {
     fn default() -> Self {
@@ -223,6 +241,8 @@ impl Default for ExecutorOptions {
             driver_yield: Duration::from_micros(500),
             panic_on_task_panic: true,
             max_polls_per_yield: 61, // same as tokio
+            enable_lifo: false, // disabled by default
+            lifo_skip_interval: 16,
         }
     }
 }
@@ -230,7 +250,7 @@ impl Default for ExecutorOptions {
 /// The priority executor: single-thread polling + class vruntime selection.
 pub struct Executor<K: QueueKey> {
     options: ExecutorOptions,
-    queue_mpscs: Vec<Arc<Mpsc<TaskId>>>,
+    task_queues: Vec<Arc<TaskQueue>>,
     is_runnable: RefCell<Vec<bool>>, // true iff ith queue is runnable
 
     tasks: RefCell<Slab<TaskRecord<K>>>,
@@ -277,18 +297,24 @@ impl<K: QueueKey> Executor<K> {
         // Create shared preemption state
         let preempt_state = Arc::new(PreemptState::new());
 
-        let queue_mpscs: Vec<Arc<Mpsc<TaskId>>> =
-            (0..num_queues).map(|_| Arc::new(Mpsc::new())).collect();
+        let task_queues: Vec<Arc<TaskQueue>> = (0..num_queues)
+            .map(|_| {
+                Arc::new(TaskQueue::new(
+                    options.enable_lifo,
+                    options.lifo_skip_interval,
+                ))
+            })
+            .collect();
 
         let qids = queues.iter().map(|q| q.id()).collect::<Vec<_>>();
         let queues: Vec<QueueState<K>> = queues
             .into_iter()
             .enumerate()
-            .map(|(idx, q)| QueueState::new(q, queue_mpscs[idx].clone()))
+            .map(|(idx, q)| QueueState::new(q, task_queues[idx].clone()))
             .collect();
 
         Ok(Rc::new(Self {
-            queue_mpscs,
+            task_queues,
             is_runnable: RefCell::new(vec![false; num_queues]),
             tasks: RefCell::new(Slab::new()),
             queues: RefCell::new(queues),
@@ -327,7 +353,7 @@ impl<K: QueueKey> Executor<K> {
         let mut tasks = self.tasks.borrow_mut();
         let entry = tasks.vacant_entry();
         let id = entry.key();
-        let preempt_state = if self.queue_mpscs.len() > 1 {
+        let preempt_state = if self.task_queues.len() > 1 {
             Some(self.preempt_state.clone())
         } else {
             None
@@ -336,7 +362,7 @@ impl<K: QueueKey> Executor<K> {
             id,
             qid,
             qidx,
-            self.queue_mpscs[qidx].clone(),
+            self.task_queues[qidx].clone(),
             preempt_state,
         ));
         let join = Arc::new(JoinState::<T>::new());
@@ -372,7 +398,7 @@ impl<K: QueueKey> Executor<K> {
         let mut is_runnable = self.is_runnable.borrow_mut();
         for (idx, q) in self.queues.borrow_mut().iter_mut().enumerate() {
             let was_runnable = is_runnable[idx];
-            is_runnable[idx] = !q.mpsc.is_empty();
+            is_runnable[idx] = !q.task_queue.is_empty();
             if !was_runnable && is_runnable[idx] {
                 // wasn't runnable before, but is now - inherit vruntime
                 q.vruntime = q.vruntime.max(self.min_vruntime.get());
@@ -403,7 +429,7 @@ impl<K: QueueKey> Executor<K> {
 
         // Multiple runnable queues - find the best one
         for (idx, q) in self.queues.borrow().iter().enumerate() {
-            if q.mpsc.is_empty() {
+            if q.task_queue.is_empty() {
                 continue;
             }
             // d_i = vruntime_i + request / share_i
@@ -455,7 +481,7 @@ impl<K: QueueKey> Executor<K> {
     /// We track total CPU time in nanoseconds and compute vruntime on-the-fly
     /// when selecting (total_cpu_nanos / weight), avoiding rounding issues.
     fn charge_class(&self, qidx: usize, elapsed: Duration) {
-        if self.queue_mpscs.len() <= 1 {
+        if self.task_queues.len() <= 1 {
             return;
         }
         let mut queues = self.queues.borrow_mut();
@@ -466,14 +492,14 @@ impl<K: QueueKey> Executor<K> {
         queue.stats.record_poll(elapsed);
     }
     fn update_min_vruntime(&self, including: u128) {
-        if self.queue_mpscs.len() <= 1 {
+        if self.task_queues.len() <= 1 {
             return;
         }
         let min_vruntime = self
             .queues
             .borrow()
             .iter()
-            .filter(|q| !q.mpsc.is_empty())
+            .filter(|q| !q.task_queue.is_empty())
             .map(|q| q.vruntime)
             .chain(Some(including))
             .min();
@@ -584,32 +610,24 @@ impl<K: QueueKey> Executor<K> {
         use futures_util::future::poll_fn;
 
         poll_fn(|cx| {
+            // Register our waker with idle_waker (for until_woken signal)
+            idle_waker.register(cx.waker());
+
+            // Register our waker with each queue's TaskQueue
+            // Register on every poll to ensure we don't miss wakeups
+            // (AtomicWaker handles duplicate registrations efficiently)
+            for task_queue in &self.task_queues {
+                task_queue.register_waker(cx.waker());
+            }
+
             // Check if until was woken
             if until_woken.load(Ordering::Acquire) {
                 return Poll::Ready(());
             }
 
             // Check if any queue has items
-            for mpsc in &self.queue_mpscs {
-                if !mpsc.is_empty() {
-                    return Poll::Ready(());
-                }
-            }
-
-            // Register our waker with idle_waker (for until_woken signal)
-            idle_waker.register(cx.waker());
-
-            // Register our waker with each queue's MPSC
-            for mpsc in &self.queue_mpscs {
-                mpsc.register_waker(cx.waker());
-            }
-
-            // Re-check after registration to avoid missed wakeups
-            if until_woken.load(Ordering::Acquire) {
-                return Poll::Ready(());
-            }
-            for mpsc in &self.queue_mpscs {
-                if !mpsc.is_empty() {
+            for task_queue in &self.task_queues {
+                if !task_queue.is_empty() {
                     return Poll::Ready(());
                 }
             }
@@ -628,8 +646,8 @@ impl<K: QueueKey> Executor<K> {
             None
         };
         // if there is only one queue, bypass all machinery
-        if self.queue_mpscs.len() == 1 {
-            match self.queue_mpscs[0].is_empty() {
+        if self.task_queues.len() == 1 {
+            match self.task_queues[0].is_empty() {
                 true => return None,
                 false => return Some((0, self.options.sched_latency)),
             }
@@ -665,7 +683,7 @@ impl<K: QueueKey> Executor<K> {
             let queue = &mut queues[qidx];
             // Check if queue was runnable before pop (to detect when it becomes runnable)
             queue.stats.record_runnable_dequeue();
-            let maybe_id = queue.mpsc.pop();
+            let maybe_id = queue.task_queue.pop();
 
             drop(queues);
 
@@ -771,6 +789,15 @@ impl<K: QueueKey> Executor<K> {
                 .record_first_service_after_runnable(now);
         }
 
+        // Drain LIFO slot at start of timeslice - only tasks woken during
+        // this execution will benefit from LIFO cache locality. Tasks that
+        // have been sitting in LIFO across timeslices have already lost
+        // their cache benefit due to context switching.
+        {
+            let queue = &self.queues.borrow()[qidx];
+            queue.task_queue.drain_lifo_to_mpsc();
+        }
+
         let mut start = now;
         let mut polls_this_slice = 0u32;
         let max_polls = self.options.max_polls_per_yield;
@@ -857,7 +884,10 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
+                let executor = ExecutorBuilder::new()
+                    .with_queue(0, 1)
+                    .build()
+                    .unwrap();
                 let counter = Arc::new(AtomicU32::new(0));
 
                 let counter_clone = counter.clone();
@@ -881,7 +911,10 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
+                let executor = ExecutorBuilder::new()
+                    .with_queue(0, 1)
+                    .build()
+                    .unwrap();
 
                 let result = executor.run_until(async {
                     let queue = executor.queue(0).unwrap();
@@ -901,7 +934,10 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
+                let executor = ExecutorBuilder::new()
+                    .with_queue(0, 1)
+                    .build()
+                    .unwrap();
                 let started = Arc::new(AtomicBool::new(false));
                 let completed = Arc::new(AtomicBool::new(false));
                 let started_clone = started.clone();
@@ -1006,7 +1042,10 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
+                let executor = ExecutorBuilder::new()
+                    .with_queue(0, 1)
+                    .build()
+                    .unwrap();
                 let queue = executor.queue(0).unwrap();
                 let execution_order = Arc::new(Mutex::new(Vec::new()));
 
@@ -1046,7 +1085,10 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
+                let executor = ExecutorBuilder::new()
+                    .with_queue(0, 1)
+                    .build()
+                    .unwrap();
                 let queue = executor.queue(0).unwrap();
                 let counter = Arc::new(AtomicU32::new(0));
                 let counter_clone = counter.clone();
@@ -1077,7 +1119,10 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
+                let executor = ExecutorBuilder::new()
+                    .with_queue(0, 1)
+                    .build()
+                    .unwrap();
                 let queue = executor.queue(0).unwrap();
                 let counter = Arc::new(AtomicU32::new(0));
 
@@ -1109,7 +1154,10 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
+                let executor = ExecutorBuilder::new()
+                    .with_queue(0, 1)
+                    .build()
+                    .unwrap();
                 let queue = executor.queue(0).unwrap();
                 let executed = Arc::new(AtomicBool::new(false));
 
@@ -1243,7 +1291,10 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
+                let executor = ExecutorBuilder::new()
+                    .with_queue(0, 1)
+                    .build()
+                    .unwrap();
                 let queue = executor.queue(0).unwrap();
                 let counter1 = Arc::new(AtomicU32::new(0));
                 let counter1_clone = counter1.clone();
@@ -1300,7 +1351,10 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
+                let executor = ExecutorBuilder::new()
+                    .with_queue(0, 1)
+                    .build()
+                    .unwrap();
                 let counter = Arc::new(AtomicU32::new(0));
                 let counter_clone = counter.clone();
                 let queue = executor.queue(0).unwrap();
@@ -1377,7 +1431,10 @@ mod tests {
         let local = LocalSet::new();
         local
             .run_until(async {
-                let executor = ExecutorBuilder::new().with_queue(0, 1).build().unwrap();
+                let executor = ExecutorBuilder::new()
+                    .with_queue(0, 1)
+                    .build()
+                    .unwrap();
                 let queue = executor.queue(0).unwrap();
                 let handle = tokio::task::spawn_local(async move {
                     executor.run_until(sleep(Duration::from_millis(100))).await;
@@ -1426,7 +1483,7 @@ mod tests {
                 }
 
                 // Executor should still be running (not crashed)
-                assert_eq!(executor.queue_mpscs.len(), 1,);
+                assert_eq!(executor.task_queues.len(), 1,);
             })
             .await;
     }

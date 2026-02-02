@@ -1,6 +1,5 @@
-use crate::mpsc::Mpsc;
 use crate::preempt::PreemptState;
-use crate::queue::{QueueKey, TaskId};
+use crate::queue::{QueueKey, TaskId, TaskQueue};
 use futures::task::ArcWake;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -23,7 +22,7 @@ pub struct TaskHeader<K: QueueKey> {
     // changes to true when task is cancelled
     // this is the ground truth for cancellation, not join state
     cancelled: AtomicBool,
-    ingress_tx: Arc<Mpsc<TaskId>>,
+    task_queue: Arc<TaskQueue>,
     /// Shared preemption state - used to signal when this task's queue
     /// would preempt the currently running queue
     preempt_state: Option<Arc<PreemptState>>,
@@ -34,7 +33,7 @@ impl<K: QueueKey> TaskHeader<K> {
         id: TaskId,
         qid: K,
         qidx: usize,
-        ingress_tx: Arc<Mpsc<TaskId>>,
+        task_queue: Arc<TaskQueue>,
         preempt_state: Option<Arc<PreemptState>>,
     ) -> Self {
         Self {
@@ -44,7 +43,7 @@ impl<K: QueueKey> TaskHeader<K> {
             queued: AtomicBool::new(false),
             done: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
-            ingress_tx,
+            task_queue,
             preempt_state,
         }
     }
@@ -58,9 +57,8 @@ impl<K: QueueKey> TaskHeader<K> {
         }
         // Only one outstanding notification per task.
         if !self.queued.swap(true, Ordering::AcqRel) {
-            // Unbounded send should not block.
-            // If receiver is dropped, ignore.
-            self.ingress_tx.push(self.id);
+            // Enqueue the task
+            self.task_queue.push(self.id);
 
             // Check if this queue would preempt the currently running queue
             if let Some(preempt_state) = &self.preempt_state {

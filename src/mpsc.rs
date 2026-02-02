@@ -10,13 +10,9 @@
 //! - **Trade-off**: One allocation per push (vs SegQueue's amortized allocation)
 
 use std::cell::UnsafeCell;
-use std::future::poll_fn;
 use std::mem::MaybeUninit;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::task::{Context, Poll};
-
-use futures_util::task::AtomicWaker;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 /// Internal queue node. Allocated on push, freed on pop.
 struct Node<T> {
@@ -28,7 +24,10 @@ struct Node<T> {
 ///
 /// ## Thread Safety
 /// - `push`: Safe from any thread, concurrently
-/// - `pop`, `recv_one`: Single consumer only (executor thread)
+/// - `pop`: Single consumer only (executor thread)
+///
+/// This is a pure queue - no length tracking or waker management.
+/// Those are handled by TaskQueue.
 #[derive(Debug)]
 pub struct Mpsc<T> {
     /// Points to the most recently pushed node.
@@ -37,10 +36,6 @@ pub struct Mpsc<T> {
     tail: UnsafeCell<*mut Node<T>>,
     /// The permanent stub node (initial sentinel).
     stub: *mut Node<T>,
-    /// Accurate item count - simpler than boolean flag.
-    len: AtomicUsize,
-    /// Consumer's waker registration.
-    waker: AtomicWaker,
 }
 
 unsafe impl<T: Send> Send for Mpsc<T> {}
@@ -57,8 +52,6 @@ impl<T> Mpsc<T> {
             head: AtomicPtr::new(stub),
             tail: UnsafeCell::new(stub),
             stub,
-            len: AtomicUsize::new(0),
-            waker: AtomicWaker::new(),
         }
     }
 
@@ -77,16 +70,6 @@ impl<T> Mpsc<T> {
         unsafe {
             (*prev).next.store(node, Ordering::Release);
         }
-
-        // Increment length and wake if queue was empty
-        if self.len.fetch_add(1, Ordering::AcqRel) == 0 {
-            self.waker.wake();
-        }
-    }
-
-    /// Register a waker to be notified when items are enqueued.
-    pub fn register_waker(&self, waker: &std::task::Waker) {
-        self.waker.register(waker);
     }
 
     /// Attempts to pop one item.
@@ -96,13 +79,7 @@ impl<T> Mpsc<T> {
     #[inline]
     pub fn pop(&self) -> Option<T> {
         // SAFETY: Single consumer invariant upheld by caller (executor)
-        let result = unsafe { self.pop_inner() };
-
-        if result.is_some() {
-            self.len.fetch_sub(1, Ordering::Release);
-        }
-
-        result
+        unsafe { self.pop_inner() }
     }
 
     #[inline]
@@ -160,39 +137,6 @@ impl<T> Mpsc<T> {
                 return None;
             }
         }
-    }
-
-    /// Checks if queue is empty.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len.load(Ordering::Acquire) == 0
-    }
-
-    /// Returns the number of items in the queue.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.len.load(Ordering::Acquire)
-    }
-
-    /// Async receive. Parks until an item is available.
-    pub async fn recv_one(&self) -> T {
-        poll_fn(|cx| self.poll_recv_one(cx)).await
-    }
-
-    fn poll_recv_one(&self, cx: &mut Context<'_>) -> Poll<T> {
-        // Fast path
-        if let Some(v) = self.pop() {
-            return Poll::Ready(v);
-        }
-
-        // Register waker, then recheck
-        self.waker.register(cx.waker());
-
-        if let Some(v) = self.pop() {
-            return Poll::Ready(v);
-        }
-
-        Poll::Pending
     }
 }
 
@@ -289,43 +233,6 @@ mod tests {
 
         assert_eq!(q.pop(), None);
         assert_eq!(q.pop(), None);
-        assert!(q.is_empty());
-    }
-
-    #[test]
-    fn test_is_empty_and_len() {
-        let q = Mpsc::new();
-
-        assert!(q.is_empty());
-        assert_eq!(q.len(), 0);
-
-        q.push(1);
-        assert!(!q.is_empty());
-        assert_eq!(q.len(), 1);
-
-        q.push(2);
-        assert_eq!(q.len(), 2);
-
-        q.pop();
-        assert_eq!(q.len(), 1);
-
-        q.pop();
-        assert!(q.is_empty());
-        assert_eq!(q.len(), 0);
-    }
-
-    #[test]
-    fn test_register_waker() {
-        use std::task::{Wake, Waker};
-
-        struct TestWaker;
-        impl Wake for TestWaker {
-            fn wake(self: Arc<Self>) {}
-        }
-
-        let q: Mpsc<i32> = Mpsc::new();
-        let waker = Waker::from(Arc::new(TestWaker));
-        q.register_waker(&waker);
     }
 
     #[test]
