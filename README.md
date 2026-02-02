@@ -4,20 +4,22 @@ Clockworker, loosely inspired by Seastar, is a single-threaded async executor
 with fair scheduling across multiple queues. Clockworker is agnostic to the underlying
 async runtime and can sit on top of any runtime like Tokio, Monoio, or Smol.
 
-┌─────────────────────────────────────────┐
-│            Your Application             │
-├─────────────────────────────────────────┤
-│   Clockworker (async executor/scheduler)│
-│   - Priority queues                     |
-│   - Timeslice management                │
-|   - Priority based preemption           |
-├─────────────────────────────────────────┤
-│   Any async IO Driver                   │
-│   ┌─────────┐ ┌─────────┐ ┌─────────┐   │
-│   │  tokio  │ │ monoio  │ │ glommio │   │
-│   │ (epoll) │ │(io_uring)│ │(io_uring)│ │
-│   └─────────┘ └─────────┘ └─────────┘   │
-└─────────────────────────────────────────┘
+```
+┌─────────────────────────────────────────────────────┐
+│                Your Application                     │
+├─────────────────────────────────────────────────────┤
+│   Clockworker (async executor/scheduler)            │
+│   - Priority queues                                 │
+│   - Timeslice management                            │
+│   - Priority based preemption                       │
+├─────────────────────────────────────────────────────┤
+│   Any async IO Driver                               │
+│   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐   │
+│   │    tokio    │ │   monoio    │ │   glommio   │   │
+│   │   (epoll)   │ │  (io_uring) │ │  (io_uring) │   │
+│   └─────────────┘ └─────────────┘ └─────────────┘   │
+└─────────────────────────────────────────────────────┘
+```
 
 **⚠️ Early/Alpha Release**: This project is in early development. APIs may change in breaking ways between versions. Use at your own risk.
 
@@ -113,7 +115,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-clockworker = "0.2.0"
+clockworker = "0.2"
 ```
 
 ## Examples
